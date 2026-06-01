@@ -174,9 +174,24 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
-        disable_overlap_schedule
-        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+    # NOTE (DP-attention hybrid-Mamba fix): when dp_size > 1 we force the per-iteration MLP-sync
+    # all_gather onto the CPU/gloo group instead of the CUDA device_group. For this model the
+    # scheduler runs with mamba_scheduler_strategy='no_buffer' -> disable_overlap_schedule=True,
+    # which (below) would otherwise select the CUDA device_group. The CUDA-device all_gather
+    # deadlocks under DP attention: the DP rank that received a real request has divergent CUDA-
+    # stream state vs the idle ranks, so building the tiny local sync tensor on-device
+    # (_get_local_tensor -> torch.tensor(..., device=cuda)) blocks on that rank's stream and the
+    # 8-way collective never assembles (py-spy: all ranks wedged in _get_local_tensor). The sync
+    # payload is only 6 int64/rank, so the gloo path's extra D2H is negligible and removes the
+    # CUDA-stream coupling that causes the hang. DP off (dp_size==1) keeps the original behavior.
+    force_cpu_dp_sync = dp_size > 1
+    if (
+        len(offload_tags) == 0
+        and not force_cpu_dp_sync
+        and (
+            disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        )
     ):
         group = tp_group.device_group
         device = tp_group.device
