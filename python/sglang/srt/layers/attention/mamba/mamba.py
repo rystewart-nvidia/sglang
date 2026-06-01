@@ -441,6 +441,15 @@ class MambaMixer2(torch.nn.Module):
 
         query_start_loc = metadata.query_start_loc
 
+        # Idle DP-attention ranks forward a zero-token batch only to stay in lockstep
+        # for collectives. There is no mamba work to do, and the idle metadata token
+        # counts (num_decodes derived from the padded seq_lens) do not match the empty
+        # input, so return early. `output` is preallocated as empty_like(hidden_states)
+        # (already zero-length), and a whole attention-TP group is idle together, so
+        # this cannot desync the out_proj all-reduce.
+        if hidden_states.shape[0] == 0:
+            return
+
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
 
