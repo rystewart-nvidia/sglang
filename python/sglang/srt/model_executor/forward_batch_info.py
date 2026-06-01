@@ -531,7 +531,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
-            ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if ret.batch_size > 0:
+                # Min-1 dummy idle batch (DP-attention lockstep): build decode-style positions
+                # so the full forward runs over the size-1 dummy. Attention/mamba metadata is
+                # (re)built in ModelRunner.forward_idle, which calls init_forward_metadata when
+                # batch_size > 0; nothing else below applies to a decode-shaped idle batch.
+                ret.positions = clamp_position(batch.seq_lens)
+            else:
+                ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
 
         # Override the positions with diffusion LLM or spec_info

@@ -502,7 +502,14 @@ class TpModelWorker(BaseTpWorker):
                 batch_result.delay_sample_func = sample_batch_func
                 return batch_result
 
-            if not model_worker_batch.is_prefill_only:
+            if model_worker_batch.forward_mode.is_idle():
+                # Idle batches (incl. the DP-attention min-1 dummy) have their output discarded
+                # by process_batch_result_idle, and their sampling_info is empty (reqs=[]) while a
+                # min-1 dummy produces one logit row -- so skip sampling to avoid a size mismatch.
+                batch_result.next_token_ids = torch.empty(
+                    0, dtype=torch.long, device=model_worker_batch.input_ids.device
+                )
+            elif not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch

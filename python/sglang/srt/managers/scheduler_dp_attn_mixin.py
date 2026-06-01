@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -19,6 +20,11 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+# DP-attention min-1 dummy lockstep prototype (NemotronH separate-layer fix). When set, idle DP
+# ranks run a real 1-token forward instead of 0 tokens so collectives fire in lockstep. Opt-in
+# (read from raw env, not the registered envs registry) so default DP behavior is unchanged.
+_DP_DUMMY_MIN1 = os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1"
 
 
 @dataclass
@@ -221,6 +227,21 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info[:, 4:6],
             )
         )
+
+        # DP-attention min-1 dummy lockstep (NemotronH separate-layer fix, PRIMARY PATH).
+        # vLLM achieves DP lockstep by running idle ranks over a min-1 *synthetic* batch so
+        # every mamba/attn/MLP/MoE collective fires naturally (no per-layer phantom-collective
+        # gating). SGLang instead feeds idle ranks 0 tokens, which desyncs the NemotronH
+        # separate-layer forwards. Here we floor every DP rank's synced token count to >=1 (the
+        # analog of vLLM's coordinate_batch_across_dp min-1 floor); prepare_for_idle then builds
+        # a real 1-token idle batch to match. Gated so default behavior is untouched.
+        if _DP_DUMMY_MIN1 and mlp_sync_info.global_num_tokens is not None:
+            mlp_sync_info.global_num_tokens = [
+                max(n, 1) for n in mlp_sync_info.global_num_tokens
+            ]
+            mlp_sync_info.global_num_tokens_for_logprob = [
+                max(n, 1) for n in mlp_sync_info.global_num_tokens_for_logprob
+            ]
 
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:

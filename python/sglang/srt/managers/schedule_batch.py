@@ -38,6 +38,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import os
 import re
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -112,6 +113,12 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+# DP-attention min-1 dummy lockstep prototype (NemotronH separate-layer fix). When set, idle DP
+# ranks build a real 1-token idle batch (instead of 0 tokens) so the full model forward runs and
+# every mamba/attn/MLP/MoE collective fires in lockstep with active ranks. Opt-in via raw env so
+# default DP behavior is unchanged. Must be paired with the >=1 floor in scheduler_dp_attn_mixin.
+_DP_DUMMY_MIN1 = os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1"
 
 
 @lru_cache(maxsize=1)
@@ -2263,14 +2270,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_idle(self):
         self.forward_mode = ForwardMode.IDLE
-        self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.seq_lens_sum = 0
-        self.extend_num_tokens = 0
+        if _DP_DUMMY_MIN1:
+            # Min-1 dummy idle batch (DP-attention lockstep, vLLM-style). Build a real 1-token
+            # decode-shaped batch so forward_idle runs the full model and issues every collective
+            # in lockstep with active ranks. The output is discarded (process_batch_result_idle
+            # ignores it, and forward_batch_generation skips sampling for idle), so the token id
+            # and cache contents are irrelevant. We point at the reserved scratch slot 0 for both
+            # req_pool_indices and out_cache_loc -- the same harmless slot cuda-graph padding
+            # writes to -- which is safe because an idle rank has no active requests. No KV slot
+            # is allocated, so there is nothing to free and no leak.
+            self.input_ids = torch.zeros(1, dtype=torch.int64, device=self.device)
+            self.seq_lens = torch.ones(1, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.ones(1, dtype=torch.int64)
+            self.orig_seq_lens = torch.ones(1, dtype=torch.int32, device=self.device)
+            self.out_cache_loc = torch.zeros(1, dtype=torch.int64, device=self.device)
+            self.req_pool_indices = torch.zeros(
+                1, dtype=torch.int64, device=self.device
+            )
+            self.seq_lens_sum = 1
+            self.extend_num_tokens = 0
+        else:
+            self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+            self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.req_pool_indices = torch.empty(
+                0, dtype=torch.int64, device=self.device
+            )
+            self.seq_lens_sum = 0
+            self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
