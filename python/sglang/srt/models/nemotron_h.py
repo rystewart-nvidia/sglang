@@ -42,6 +42,11 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -463,20 +468,25 @@ class NemotronHAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        # Under DP attention the attention layers are replicated across the
+        # attention-DP partition and must shard by the attention TP size/rank,
+        # not the global TP. When DP attention is off these equal the global TP,
+        # so non-DP runs are unaffected.
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+        if self.total_num_kv_heads >= attn_tp_size:
+            # Number of KV heads is greater than the attention TP size, so we
+            # partition the KV heads across the attention TP GPUs.
+            assert self.total_num_kv_heads % attn_tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            # Number of KV heads is less than the attention TP size, so we
+            # replicate the KV heads across the attention TP GPUs.
+            assert attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
         if hasattr(config, "head_dim") and config.head_dim is not None:
             self.head_dim = config.head_dim
         else:
@@ -492,6 +502,8 @@ class NemotronHAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -499,6 +511,9 @@ class NemotronHAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
 
