@@ -118,10 +118,10 @@ class NemotronHMLP(nn.Module):
         )
         self.act_fn = ReLU2()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, skip_all_reduce: bool = False):
         x, _ = self.up_proj(x)
         x = self.act_fn(x)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=skip_all_reduce)
         return x
 
 
@@ -277,7 +277,9 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, skip_all_reduce: bool = False
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
@@ -294,10 +296,36 @@ class NemotronHMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states += shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not skip_all_reduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+def _input_norm_maybe_fused(
+    norm,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    incoming_is_partial: bool,
+    incoming_partial_from_moe: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a decoder layer's input RMSNorm.
+
+    When ``incoming_is_partial`` is set, the previous layer deferred its tensor-parallel
+    all-reduce (``skip_all_reduce=True``) and ``hidden_states`` is an un-reduced partial.
+    In that case fuse all_reduce + residual-add + RMSNorm into a single FlashInfer kernel
+    (``use_attn_tp_group`` selects the attn-TP vs MoE-TP group). Otherwise take the normal
+    path. Gated entirely by the caller's ``fuse`` decision so the default path is unchanged.
+    """
+    if residual is None:
+        return norm(hidden_states), hidden_states
+    if incoming_is_partial:
+        return norm.forward_with_allreduce_fusion(
+            hidden_states,
+            residual,
+            use_attn_tp_group=not incoming_partial_from_moe,
+        )
+    return norm(hidden_states, residual)
 
 
 class NemotronHMLPDecoderLayer(nn.Module):
@@ -337,14 +365,14 @@ class NemotronHMLPDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        incoming_is_partial: bool = False,
+        incoming_partial_from_moe: bool = False,
+        emit_partial: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
-
-        hidden_states = self.mixer.forward(hidden_states)
+        hidden_states, residual = _input_norm_maybe_fused(
+            self.norm, hidden_states, residual, incoming_is_partial, incoming_partial_from_moe
+        )
+        hidden_states = self.mixer.forward(hidden_states, skip_all_reduce=emit_partial)
         return hidden_states, residual
 
 
@@ -373,14 +401,14 @@ class NemotronHMoEDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        incoming_is_partial: bool = False,
+        incoming_partial_from_moe: bool = False,
+        emit_partial: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
-
-        hidden_states = self.mixer.forward(hidden_states)
+        hidden_states, residual = _input_norm_maybe_fused(
+            self.norm, hidden_states, residual, incoming_is_partial, incoming_partial_from_moe
+        )
+        hidden_states = self.mixer.forward(hidden_states, skip_all_reduce=emit_partial)
         return hidden_states, residual
 
 
@@ -432,12 +460,15 @@ class NemotronHMambaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        incoming_is_partial: bool = False,
+        incoming_partial_from_moe: bool = False,
+        emit_partial: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
+        # Phase 1: mamba consumes a partial (fused input norm) but keeps its normal
+        # out_proj all-reduce, so it never emits a partial (emit_partial is ignored).
+        hidden_states, residual = _input_norm_maybe_fused(
+            self.norm, hidden_states, residual, incoming_is_partial, incoming_partial_from_moe
+        )
 
         if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
@@ -513,12 +544,15 @@ class NemotronHAttention(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn.forward(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_all_reduce)
         return output
 
 
@@ -547,15 +581,17 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        incoming_is_partial: bool = False,
+        incoming_partial_from_moe: bool = False,
+        emit_partial: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.norm(hidden_states)
-        else:
-            hidden_states, residual = self.norm(hidden_states, residual)
-
+        hidden_states, residual = _input_norm_maybe_fused(
+            self.norm, hidden_states, residual, incoming_is_partial, incoming_partial_from_moe
+        )
         hidden_states = self.mixer.forward(
-            hidden_states=hidden_states, forward_batch=forward_batch
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            skip_all_reduce=emit_partial,
         )
         return hidden_states, residual
 
@@ -594,6 +630,7 @@ class NemotronHModel(nn.Module):
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -639,14 +676,40 @@ class NemotronHModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # FlashInfer all-reduce + residual + RMSNorm fusion (TP decode only). Each layer that
+        # emits an un-reduced TP partial (skip_all_reduce) has its all-reduce fused into the NEXT
+        # layer's input RMSNorm. Gated per-forward by apply_flashinfer_allreduce_fusion (enforces
+        # the <=2048-token cap so the >2048-token prefill auto-falls-back, SM/flag/workspace/not-DP).
+        # No-op when the server arg is off -> default path is byte-identical. Phase 1: mamba layers
+        # consume but do not emit (they keep their normal out_proj reduce).
+        from sglang.srt.layers.communicator import apply_flashinfer_allreduce_fusion
+
+        fuse = self.tp_size > 1 and apply_flashinfer_allreduce_fusion(
+            hidden_states.shape[0]
+        )
+        incoming_is_partial = False
+        incoming_partial_from_moe = False
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
+            is_last = i == self.end_layer - 1
+            emit_partial = (
+                fuse
+                and not is_last
+                and not isinstance(layer, NemotronHMambaDecoderLayer)
+            )
             hidden_states, residual = layer.forward(
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
+                incoming_is_partial=incoming_is_partial,
+                incoming_partial_from_moe=incoming_partial_from_moe,
+                emit_partial=emit_partial,
+            )
+            incoming_is_partial = emit_partial
+            incoming_partial_from_moe = emit_partial and isinstance(
+                layer, NemotronHMoEDecoderLayer
             )
 
         if not self.pp_group.is_last_rank:
