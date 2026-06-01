@@ -1482,6 +1482,13 @@ def apply_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
+    # An empty (zero-token) input has no work to do, and the cutlass fp8 GEMM does
+    # not support a zero-sized M dimension (it errors with a non-success status).
+    # This happens for idle DP-attention ranks (0 local tokens), so return an
+    # appropriately shaped empty tensor directly.
+    if input_2d.shape[0] == 0:
+        return torch.empty(output_shape, dtype=input.dtype, device=input.device)
+
     if compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
