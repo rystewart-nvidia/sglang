@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
     get_moe_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import ReLU2
@@ -43,10 +44,16 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.dp_attention import (
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_global_dp_buffer,
+    get_local_dp_buffer,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -385,7 +392,32 @@ class NemotronHMoEDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer.forward(hidden_states)
+        # Under DP attention the residual stream is data-parallel (each rank holds only
+        # its local tokens) while the MoE experts are sharded across the whole EP world.
+        # Gather every DP rank's tokens so each rank's expert shard sees the full token
+        # set, run the MoE (its internal all-reduce combines the EP shards), then scatter
+        # the result back to this rank's local tokens. This mirrors deepseek_v4's
+        # tp-moe-gather path and is required because NemotronH's separate MoE layer has no
+        # built-in token dispatch. No-op for non-DP runs. Idle ranks contribute 0 tokens
+        # to the gather but still run the MoE on the (non-empty) gathered tokens, keeping
+        # the collectives in lockstep.
+        use_dp_moe_gather = (
+            get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none()
+        )
+        if use_dp_moe_gather:
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            hidden_states = self.mixer.forward(hidden_states)
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
+        else:
+            hidden_states = self.mixer.forward(hidden_states)
         return hidden_states, residual
 
 
