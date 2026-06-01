@@ -208,11 +208,20 @@ class Mamba2Metadata(ForwardMetadata):
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
+        # Under DP attention the batch is padded so that every rank forwards the same
+        # number of tokens (a multiple of attn_tp_size), so num_prefill_tokens
+        # (== extend_num_tokens, padded) can exceed the real prefill tokens described by
+        # query_start_loc. Assign the trailing pad tokens to one extra throwaway sequence
+        # id so seq_idx still covers all num_prefill_tokens; the pad tokens are masked out
+        # of the real sequences' chunk scan and their (discarded) outputs do not affect the
+        # per-sequence states returned via cu_seqlens. No-op when there is no padding.
+        query_start_loc_diff = query_start_loc.diff()
+        num_pad_tokens = num_prefill_tokens - query_start_loc[num_prefills]
         seq_idx = torch.repeat_interleave(
             torch.arange(
-                num_prefills, dtype=torch.int32, device=query_start_loc.device
+                num_prefills + 1, dtype=torch.int32, device=query_start_loc.device
             ),
-            query_start_loc.diff(),
+            torch.cat([query_start_loc_diff, num_pad_tokens.reshape(1)]),
             output_size=num_prefill_tokens,
         )
         seq_idx.unsqueeze_(0)
