@@ -121,8 +121,8 @@ def mixer2_gated_norm_tensor_parallel(
         mixer.weight.weight_loader(mixer.weight, weight)
 
     with (
-        patch.object(m2, "get_tensor_model_parallel_world_size", return_value=1),
-        patch.object(m2, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(m2, "get_attention_tp_size", return_value=1),
+        patch.object(m2, "get_attention_tp_rank", return_value=0),
     ):
         # create gated-norm without TP to compute reference
         mixer_single_gpu = m2.Mixer2RMSNormGated(

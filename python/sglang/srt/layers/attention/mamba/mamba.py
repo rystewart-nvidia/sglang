@@ -10,14 +10,17 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
     mamba_chunk_scan_combined,
     selective_state_update,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -208,8 +211,12 @@ class MambaMixer2(torch.nn.Module):
         #   may be replicated to follow the head shard.
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        # Mamba/linear-attn layers are replicated across the attention-DP
+        # partition, so they must shard by the attention TP size/rank, not the
+        # global TP. When DP attention is off these return the global TP, so
+        # non-DP runs are unaffected.
+        self.tp_size = get_attention_tp_size()
+        self.tp_rank = get_attention_tp_rank()
 
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim
@@ -257,6 +264,8 @@ class MambaMixer2(torch.nn.Module):
                 ],
                 bias=use_conv_bias,
                 quant_config=None,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=f"{prefix}.conv1d",
             )
 
@@ -271,6 +280,8 @@ class MambaMixer2(torch.nn.Module):
                 ],
                 bias=use_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=f"{prefix}.in_proj",
             )
         else:
@@ -282,6 +293,8 @@ class MambaMixer2(torch.nn.Module):
                 output_size=self.conv_dim,
                 bias=use_conv_bias,
                 quant_config=None,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=f"{prefix}.conv1d",
             )
 
@@ -290,6 +303,8 @@ class MambaMixer2(torch.nn.Module):
                 output_size=intermediate_size + self.conv_dim + self.num_heads,
                 bias=use_bias,
                 quant_config=quant_config,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 prefix=f"{prefix}.in_proj",
             )
 
@@ -394,6 +409,9 @@ class MambaMixer2(torch.nn.Module):
             bias=use_bias,
             input_is_parallel=True,
             quant_config=quant_config,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
 
