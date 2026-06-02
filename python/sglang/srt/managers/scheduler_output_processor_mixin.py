@@ -183,6 +183,15 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # DP-attention synthetic idle dummy: a real EXTEND batch with no requests (reqs=[]) run
+        # only to keep idle ranks in lockstep. Its output is discarded and it has no per-request
+        # state (no prefill_stats, nothing to stream/free), so skip result processing entirely --
+        # mirrors process_batch_result_idle. A real prefill always has >=1 request.
+        if not batch.reqs:
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+            return
+
         skip_stream_req = None
 
         if self.is_generation:
