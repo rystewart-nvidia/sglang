@@ -491,7 +491,14 @@ class MambaMixer2(torch.nn.Module):
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
         num_actual_tokens = num_prefill_tokens + num_decode_tokens
-        assert num_actual_tokens == projected_states.shape[0]
+        # DEBUG (remove before PR): surface the accounting on mismatch to localize the
+        # MAX_LEN pad vs mamba-metadata token-count divergence under batched/chunked prefill.
+        assert num_actual_tokens == projected_states.shape[0], (
+            f"MAMBA_TOK_MISMATCH num_actual={num_actual_tokens} "
+            f"proj={projected_states.shape[0]} num_prefill_tokens={num_prefill_tokens} "
+            f"num_decode_tokens={num_decode_tokens} num_prefills={num_prefills} "
+            f"num_decodes={num_decodes} is_tv={metadata.is_target_verify}"
+        )
 
         # NOTE: V0 put prefill before decode
         # Separate prefill and decode by splitting varlen input

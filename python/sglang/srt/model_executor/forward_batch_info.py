@@ -903,7 +903,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
-                self.extend_num_tokens = bs
+                # MAX_LEN pads input_ids to num_tokens (global max), so extend_num_tokens
+                # must be the PADDED count to match the hidden-state row count (mamba asserts
+                # num_prefill_tokens == projected_states.shape[0]); the bs real 1-token
+                # extends are described by extend_seq_lens and the (num_tokens - bs) pad
+                # tokens are absorbed downstream (mamba throwaway seq_idx / attn pad slice).
+                # Mirrors the genuine-extend branch below (extend_num_tokens = num_tokens).
+                self.extend_num_tokens = num_tokens
                 self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
                 self.extend_prefix_lens = self.seq_lens - 1
                 self.extend_start_loc = torch.arange(
