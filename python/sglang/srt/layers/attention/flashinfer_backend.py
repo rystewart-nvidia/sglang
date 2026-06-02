@@ -172,6 +172,14 @@ class FlashInferAttnBackend(AttentionBackend):
         ):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 
+        # NemotronH under DP attention (attn_tp=1) REPLICATES attention -> each rank runs the full
+        # head count, so the flashinfer prefill tmp buffer (batch_prefill_tmp_v) is much larger than
+        # the TP-sharded case the 384MB default assumes. A 2048-token chunk needs ~512MB for tmp_v
+        # alone; the default overflows ("Buffer overflow ... Increase the workspace buffer size").
+        # Bump generously (GPU has ample headroom under NVFP4). TP-only is unaffected by the size.
+        if "NemotronHForCausalLM" in model_runner.model_config.hf_config.architectures:
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
         # More information can be found here: https://github.com/flashinfer-ai/flashinfer/pull/1675
