@@ -76,7 +76,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.dp_attention import (
-    dp_gather_partial,
+    dp_gather_replicate,
     dp_scatter,
     get_attention_dp_size,
     get_attention_tp_rank,
@@ -468,7 +468,12 @@ class NemotronHMoEDecoderLayer(nn.Module):
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            # After attention/mamba o_proj all_reduce over the attn-TP group, the residual
+            # stream is REPLICATED (identical) across attn_tp ranks. dp_gather_partial would
+            # reduce_scatter-sum those identical copies (attn_tp x inflation -> garbage); the
+            # replicate gather zeros non-leader copies so the sum is the tokens x1. attn_tp==1
+            # (DEP8) is byte-identical (attn_tp_size==1 gather ignores partial/replicate).
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
             _moe_stat("after_gather", hidden_states)
             hidden_states = self.mixer.forward(hidden_states)
             hidden_states, global_hidden_states = (
