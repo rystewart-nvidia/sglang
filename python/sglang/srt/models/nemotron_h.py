@@ -680,6 +680,11 @@ class NemotronHModel(nn.Module):
                 self.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                # Under DP attention each rank holds its OWN tokens; the vocab-parallel
+                # embedding must reduce over the attention-TP group, not the global TP
+                # group (a global all-reduce would sum different ranks' different tokens
+                # together -> garbage). Matches falcon_h1/deepseek_v2. No-op when DP off.
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -828,6 +833,9 @@ class NemotronHForCausalLM(nn.Module):
                     ),
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
+                    # Same DP-attention group fix as embed_tokens; gated on the dp-lm-head
+                    # option (matches falcon_h1/deepseek_v2). No-op when the flag is off.
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
