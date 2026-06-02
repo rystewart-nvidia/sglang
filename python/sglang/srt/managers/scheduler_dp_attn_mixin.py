@@ -242,23 +242,33 @@ def prepare_mlp_sync_batch_raw(
         # 1-token decode-style idle batch. for_logprob stays >=1 (the dummy yields one sample).
         # prepare_for_idle builds the matching batch. Gated so default behavior is untouched.
         if _DP_DUMMY_MIN1 and mlp_sync_info.global_num_tokens is not None:
-            idle_tokens = (
-                _DP_DUMMY_EXTEND_LEN if mlp_sync_info.is_extend_in_batch else 1
-            )
+            if mlp_sync_info.is_extend_in_batch:
+                # Homogenize idle ranks to the active prefill shape: floor them to the max real
+                # token count so EVERY rank runs identical mamba/attn/MoE shapes. This is what
+                # keeps kernels compiling in lockstep -- a smaller idle shape (e.g. fixed 8 or 1)
+                # is a *novel* shape on the idle rank, so it JIT-compiles mid-forward while the
+                # other ranks wait at the next collective -> deadlock (observed: seqlen==1 conv,
+                # then the MoE GEMM). max(.,2) also dodges the seqlen==1 prefill-conv specialization.
+                # No padding (the dummy genuinely has this many tokens), so Mamba's
+                # num_actual==projected invariant holds -- no mamba change.
+                idle_tokens = max(max(mlp_sync_info.global_num_tokens), 2)
+            else:
+                idle_tokens = 1
             mlp_sync_info.global_num_tokens = [
                 n if n > 0 else idle_tokens for n in mlp_sync_info.global_num_tokens
             ]
             mlp_sync_info.global_num_tokens_for_logprob = [
                 max(n, 1) for n in mlp_sync_info.global_num_tokens_for_logprob
             ]
+            _dp_idle_extend_len = (
+                idle_tokens if mlp_sync_info.is_extend_in_batch else None
+            )
+        else:
+            _dp_idle_extend_len = None
 
-    # During a prefill the idle dummy must be a real N-token EXTEND batch (mode-match + avoid
-    # the degenerate seqlen==1 prefill conv); otherwise the default 1-token idle batch.
-    idle_extend_len = (
-        _DP_DUMMY_EXTEND_LEN
-        if (_DP_DUMMY_MIN1 and not skip_all_gather and mlp_sync_info.is_extend_in_batch)
-        else None
-    )
+    # During a prefill the idle dummy is a real EXTEND batch sized to the active shape (mode-match
+    # + identical kernel shapes + avoids the degenerate seqlen==1 conv); otherwise 1-token idle.
+    idle_extend_len = _dp_idle_extend_len if not skip_all_gather else None
 
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
