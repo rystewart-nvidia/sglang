@@ -69,6 +69,13 @@ class Mamba2Metadata(ForwardMetadata):
 
         extend_seq_lens_cpu: list[int]
 
+        # Under MAX_LEN DP padding the orphan pad tokens are assigned a throwaway seq id
+        # (= num_prefills) in seq_idx. cu_seqlens_with_pad is query_start_loc extended with a
+        # trailing boundary at num_prefill_tokens so that pad seq is a VALID sequence in the
+        # chunk-scan (cu_seqlens / chunk_indices / initial_states all cover it) -- otherwise
+        # the SSD chunk-scan kernel indexes seq num_prefills out of bounds. None when no pad.
+        cu_seqlens_with_pad: Optional[torch.Tensor] = None
+
     mixed_metadata: MixedMetadata | None = None
     """`mixed_metadata` is used for extend/mixed requests"""
 
@@ -226,6 +233,26 @@ class Mamba2Metadata(ForwardMetadata):
         )
         seq_idx.unsqueeze_(0)
 
+        # When there is orphan pad (MAX_LEN DP padding), make the pad tokens' throwaway seq
+        # (id num_prefills) a real trailing sequence in cu_seqlens so the chunk-scan kernel can
+        # index it. CPU-side has_pad check (extend_seq_lens_cpu is on host) avoids a GPU sync.
+        real_prefill_tokens = sum(int(x) for x in forward_batch.extend_seq_lens_cpu)
+        cu_seqlens_with_pad = None
+        cu_seqlens_for_chunks = query_start_loc
+        if num_prefill_tokens > real_prefill_tokens:
+            cu_seqlens_with_pad = torch.cat(
+                [
+                    query_start_loc,
+                    torch.full(
+                        (1,),
+                        num_prefill_tokens,
+                        dtype=query_start_loc.dtype,
+                        device=query_start_loc.device,
+                    ),
+                ]
+            )
+            cu_seqlens_for_chunks = cu_seqlens_with_pad
+
         # We compute metadata for chunked prefill once at the top level model
         # forward and reuse them in mamba layers. If not needed, they will be
         # ignored inside mamba kernels.
@@ -233,7 +260,7 @@ class Mamba2Metadata(ForwardMetadata):
         if prep_initial_states:
             chunk_indices, chunk_offsets = (
                 cls._query_start_loc_to_chunk_indices_offsets(
-                    query_start_loc, chunk_size, num_prefill_tokens
+                    cu_seqlens_for_chunks, chunk_size, num_prefill_tokens
                 )
             )
 
@@ -260,6 +287,7 @@ class Mamba2Metadata(ForwardMetadata):
                 seq_idx=seq_idx,
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
+                cu_seqlens_with_pad=cu_seqlens_with_pad,
                 extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ),
         )

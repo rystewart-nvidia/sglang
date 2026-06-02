@@ -577,6 +577,15 @@ class MambaMixer2(torch.nn.Module):
             hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
 
             # 3. State Space Model sequence transformation
+            # Under MAX_LEN DP padding the orphan pad tokens form a trailing throwaway sequence
+            # (seq id num_prefills). Use the pad-extended cu_seqlens so the chunk-scan treats it
+            # as a real sequence (no OOB); give it a zero initial state; its varlen state row is
+            # discarded below. cu_seqlens_with_pad is None when there is no padding (no-op).
+            cu_seqlens_p = (
+                mixed_metadata.cu_seqlens_with_pad
+                if mixed_metadata.cu_seqlens_with_pad is not None
+                else query_start_loc_p
+            )
             initial_states = None
             if has_initial_states_p is not None and prep_initial_states:
                 initial_states = torch.where(
@@ -584,6 +593,11 @@ class MambaMixer2(torch.nn.Module):
                     ssm_state[state_indices_tensor_p],
                     0,
                 )
+                if mixed_metadata.cu_seqlens_with_pad is not None:
+                    # extra zero initial state for the trailing pad sequence
+                    initial_states = torch.cat(
+                        [initial_states, torch.zeros_like(initial_states[:1])], dim=0
+                    )
 
             # NOTE: final output is an in-place update of out tensor
             varlen_state = mamba_chunk_scan_combined(
@@ -601,7 +615,7 @@ class MambaMixer2(torch.nn.Module):
                 seq_idx=mixed_metadata.seq_idx,
                 chunk_indices=mixed_metadata.chunk_indices,
                 chunk_offsets=mixed_metadata.chunk_offsets,
-                cu_seqlens=query_start_loc_p,
+                cu_seqlens=cu_seqlens_p,
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
@@ -615,7 +629,9 @@ class MambaMixer2(torch.nn.Module):
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
-            ssm_state[state_indices_tensor_p] = varlen_state
+            # - with the pad-extended cu_seqlens it has num_prefills+1 rows; drop the trailing
+            #   pad-sequence row before writing the real per-sequence states.
+            ssm_state[state_indices_tensor_p] = varlen_state[:num_prefills]
 
         # Process decode requests
         if has_decode:
