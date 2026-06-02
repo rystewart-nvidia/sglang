@@ -67,3 +67,21 @@ This is queued **after** the DEP8 DP-attention min-1 / MAX_LEN+mamba-trim work o
 - **Conclusion:** overlap-scheduler-via-disable-radix is a marginal no-MTP lever and a no-op for MTP.
   Stream-2 perf work should refocus on the **allreduce+rmsnorm FUSION at concurrency** (this branch's
   actual contribution; only tested at conc=1 = wash; expected to help at conc>=2) and spec-v2.
+
+## BLOCKER (2026-06-01) — allreduce+rmsnorm FUSION can't initialize on the current image
+
+Attempted to measure the fusion at concurrency (TP4, MTP, spec-v2, ALLREDUCE_FUSION=1, job 3098611).
+The server came up but **the fusion auto-disabled at init**:
+`Failed to initialize FlashInfer workspace: create_allreduce_fusion_workspace() got an unexpected
+keyword argument 'group'. Disabling flashinfer allreduce fusion permanently.` (all TP ranks).
+- **Cause:** this fork (release/v0.5.12 + cherry-picks) calls the newer flashinfer API
+  `create_allreduce_fusion_workspace(group=...)`, but the deployment image (`sglang-v0.5.11.sqsh`) ships
+  **flashinfer 0.6.8.post1**, whose signature has no `group` kwarg. (Same version-skew family as the
+  `SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK` we already set for mounting the newer fork on the 0.6.8 image.)
+- **Effect:** the fusion lever (commit 2dafea956) is **untestable on this image** — any
+  ALLREDUCE_FUSION=1 run silently falls back to the unfused path (≈ MTP baseline).
+- **Fix options:** (a) adapt the fork's `create_allreduce_fusion_workspace(...)` call to the 0.6.8
+  signature (drop/translate `group`) for the workspace init path; or (b) build/use an image with
+  flashinfer >= 0.6.11 (matching the fork). (a) is the smaller change for testing on the current image.
+- **Status:** fusion-at-concurrency measurement is BLOCKED until this is resolved. The overlap-scheduler
+  finding above (marginal) stands independently.
