@@ -2268,17 +2268,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Reset the encoder cached status
         self.encoder_cached = [True] * len(self.reqs)
 
-    def prepare_for_idle(self):
-        self.forward_mode = ForwardMode.IDLE
-        if _DP_DUMMY_MIN1:
-            # Min-1 dummy idle batch (DP-attention lockstep, vLLM-style). Build a real 1-token
-            # decode-shaped batch so forward_idle runs the full model and issues every collective
-            # in lockstep with active ranks. The output is discarded (process_batch_result_idle
-            # ignores it, and forward_batch_generation skips sampling for idle), so the token id
-            # and cache contents are irrelevant. We point at the reserved scratch slot 0 for both
-            # req_pool_indices and out_cache_loc -- the same harmless slot cuda-graph padding
-            # writes to -- which is safe because an idle rank has no active requests. No KV slot
-            # is allocated, so there is nothing to free and no leak.
+    def prepare_for_idle(self, extend_dummy_len: Optional[int] = None):
+        if _DP_DUMMY_MIN1 and extend_dummy_len is not None:
+            # Prefill-phase DP-attention idle dummy: a real EXTEND batch of N (>=2) tokens in a
+            # single sequence. It must MODE-MATCH the active prefilling rank (EXTEND, not IDLE) so
+            # NemotronH's separate-layer forward stays in lockstep, AND it must avoid seqlen==1:
+            # Triton specializes the prefill causal_conv1d kernel on seqlen==1 into a separate
+            # kernel the (6-token) warmup never compiled, so a 1-token EXTEND idle dummy wedges
+            # first-loading it. N>=2 reuses the warmed prefill-conv branch. reqs=[] + is_prefill_only
+            # make the worker skip sampling (emit zeros(len(seq_lens))) and process_batch_result
+            # no-op. req_pool slot 0 / KV slots 0..N-1 are free on an idle rank (no live requests).
+            n = extend_dummy_len
+            self.forward_mode = ForwardMode.EXTEND
+            self.input_ids = torch.zeros(n, dtype=torch.int64, device=self.device)
+            self.seq_lens = torch.full((1,), n, dtype=torch.int64, device=self.device)
+            self.seq_lens_cpu = torch.full((1,), n, dtype=torch.int64)
+            self.orig_seq_lens = torch.full(
+                (1,), n, dtype=torch.int32, device=self.device
+            )
+            self.out_cache_loc = torch.arange(n, dtype=torch.int64, device=self.device)
+            self.req_pool_indices = torch.zeros(
+                1, dtype=torch.int64, device=self.device
+            )
+            self.seq_lens_sum = n
+            self.extend_num_tokens = n
+            self.extend_lens = [n]
+            self.prefix_lens = [0]
+            self.extend_logprob_start_lens = [0]
+            self.is_prefill_only = True
+        elif _DP_DUMMY_MIN1:
+            # Decode/generation-phase idle dummy: 1-token IDLE batch. IDLE routes to the decode
+            # conv (causal_conv1d_update, warmed, handles seqlen==1) and is skipped everywhere via
+            # is_idle(). Scratch slot 0 is free on an idle rank; no alloc, no leak.
+            self.forward_mode = ForwardMode.IDLE
             self.input_ids = torch.zeros(1, dtype=torch.int64, device=self.device)
             self.seq_lens = torch.ones(1, dtype=torch.int64, device=self.device)
             self.seq_lens_cpu = torch.ones(1, dtype=torch.int64)
@@ -2290,6 +2312,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_sum = 1
             self.extend_num_tokens = 0
         else:
+            self.forward_mode = ForwardMode.IDLE
             self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
             self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
             self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)

@@ -25,6 +25,10 @@ _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 # ranks run a real 1-token forward instead of 0 tokens so collectives fire in lockstep. Opt-in
 # (read from raw env, not the registered envs registry) so default DP behavior is unchanged.
 _DP_DUMMY_MIN1 = os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1"
+# Token count for the prefill-phase idle EXTEND dummy. Must be >=2 (a 1-token EXTEND hits Triton's
+# seqlen==1 prefill-conv specialization, which the warmup never compiles -> wedge) and a "normal"
+# Triton specialization bucket (avoid 1 and multiples of 16) so it reuses warmup-compiled kernels.
+_DP_DUMMY_EXTEND_LEN = int(os.environ.get("SGLANG_DP_DUMMY_EXTEND_LEN", "8"))
 
 
 @dataclass
@@ -140,7 +144,7 @@ def prepare_mlp_sync_batch_raw(
     attn_tp_size: int,
     attn_cp_size: int,
     tp_group: GroupCoordinator,
-    get_idle_batch: Callable[[], ScheduleBatch],
+    get_idle_batch: Callable[[Optional[int]], ScheduleBatch],
     disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
@@ -229,28 +233,43 @@ def prepare_mlp_sync_batch_raw(
         )
 
         # DP-attention min-1 dummy lockstep (NemotronH separate-layer fix, PRIMARY PATH).
-        # vLLM achieves DP lockstep by running idle ranks over a min-1 *synthetic* batch so
-        # every mamba/attn/MLP/MoE collective fires naturally (no per-layer phantom-collective
-        # gating). SGLang instead feeds idle ranks 0 tokens, which desyncs the NemotronH
-        # separate-layer forwards. Here we floor every DP rank's synced token count to >=1 (the
-        # analog of vLLM's coordinate_batch_across_dp min-1 floor); prepare_for_idle then builds
-        # a real 1-token idle batch to match. Gated so default behavior is untouched.
+        # vLLM achieves DP lockstep by running idle ranks over a synthetic batch so every
+        # mamba/attn/MLP/MoE collective fires naturally (no per-layer phantom-collective gating).
+        # SGLang instead feeds idle ranks 0 tokens, which desyncs the NemotronH separate-layer
+        # forwards. Floor every idle DP rank (those reporting 0 tokens) to a non-zero dummy that
+        # MODE-MATCHES the active ranks: during a prefill (is_extend_in_batch) an N-token EXTEND
+        # dummy (N avoids the seqlen==1 prefill-conv Triton specialization); during generation a
+        # 1-token decode-style idle batch. for_logprob stays >=1 (the dummy yields one sample).
+        # prepare_for_idle builds the matching batch. Gated so default behavior is untouched.
         if _DP_DUMMY_MIN1 and mlp_sync_info.global_num_tokens is not None:
+            idle_tokens = (
+                _DP_DUMMY_EXTEND_LEN if mlp_sync_info.is_extend_in_batch else 1
+            )
             mlp_sync_info.global_num_tokens = [
-                max(n, 1) for n in mlp_sync_info.global_num_tokens
+                n if n > 0 else idle_tokens for n in mlp_sync_info.global_num_tokens
             ]
             mlp_sync_info.global_num_tokens_for_logprob = [
                 max(n, 1) for n in mlp_sync_info.global_num_tokens_for_logprob
             ]
 
+    # During a prefill the idle dummy must be a real N-token EXTEND batch (mode-match + avoid
+    # the degenerate seqlen==1 prefill conv); otherwise the default 1-token idle batch.
+    idle_extend_len = (
+        _DP_DUMMY_EXTEND_LEN
+        if (_DP_DUMMY_MIN1 and not skip_all_gather and mlp_sync_info.is_extend_in_batch)
+        else None
+    )
+
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
         batch_to_gather = local_batch
         if local_batch is None:
-            batch_to_gather = local_batch = get_idle_batch()
+            batch_to_gather = local_batch = get_idle_batch(idle_extend_len)
         elif local_batch.forward_mode.is_prebuilt():
             # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
-            batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
+            batch_to_gather = local_batch.inner_idle_batch = get_idle_batch(
+                idle_extend_len
+            )
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
@@ -293,7 +312,9 @@ class SchedulerDPAttnMixin:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 
-    def get_idle_batch(self: Scheduler) -> ScheduleBatch:
+    def get_idle_batch(
+        self: Scheduler, extend_dummy_len: Optional[int] = None
+    ) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],
             self.req_to_token_pool,
@@ -303,5 +324,5 @@ class SchedulerDPAttnMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
-        idle_batch.prepare_for_idle()
+        idle_batch.prepare_for_idle(extend_dummy_len)
         return idle_batch
