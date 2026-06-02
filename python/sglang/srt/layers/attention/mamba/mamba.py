@@ -544,6 +544,12 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+            # `causal_conv1d_fn` dispatches to triton when x is non-contiguous AND seq_lens_cpu is
+            # passed (it avoids a .contiguous() copy). The transpose above makes x non-contiguous, so
+            # to actually reach the precompiled CUDA kernel (no per-seqlen JIT) on the non-triton path
+            # we must make x contiguous here; the CUDA wrapper would do this copy internally anyway.
+            if not use_triton_causal_conv:
+                x = x.contiguous()
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv

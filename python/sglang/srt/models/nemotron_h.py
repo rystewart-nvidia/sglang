@@ -17,11 +17,18 @@
 
 """Inference-only NemotronH model."""
 
+import os
 from collections.abc import Iterable
 from typing import Optional, Union
 
 import torch
 from torch import nn
+
+# DP-attention min-1 prototype: when set, use the precompiled CUDA causal_conv1d for prefill/decode
+# (no per-seqlen triton JIT -> no mid-lockstep compile desync under DP concurrency); triton is kept
+# only for the speculative target-verify path (which requires intermediate-state save). Opt-in so
+# default behavior is byte-identical.
+_DP_DUMMY_MIN1 = os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1"
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import (
@@ -463,12 +470,20 @@ class NemotronHMambaDecoderLayer(nn.Module):
         attn_backend = forward_batch.attn_backend
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+        # Triton causal_conv1d JIT-compiles per sequence length; under DP attention, concurrent ranks
+        # hitting different chunk seqlens compile at different times and deadlock at the next
+        # collective. The precompiled CUDA conv has no per-seqlen JIT, so use it for prefill/decode
+        # and keep triton ONLY for the speculative target-verify path (mamba.py asserts triton there
+        # for intermediate-state save). Gated; default keeps the original always-triton behavior.
+        use_triton_causal_conv = True
+        if _DP_DUMMY_MIN1:
+            use_triton_causal_conv = forward_batch.forward_mode.is_target_verify()
         attn_backend.linear_attn_backend.forward(
             mixer=self.mixer,
             layer_id=self.layer_id,
             hidden_states=hidden_states,
             output=output,
-            use_triton_causal_conv=True,
+            use_triton_causal_conv=use_triton_causal_conv,
         )
         return output
 
