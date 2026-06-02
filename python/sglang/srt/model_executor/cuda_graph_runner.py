@@ -528,8 +528,13 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     if mul_base % get_attention_cp_size() != 0:
         mul_base *= get_attention_cp_size()
 
-    # pad `num_max_requests` to avoid being filtered out
-    num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
+    # Round `num_max_requests` to a multiple of mul_base so it survives the `% mul_base` filter
+    # below. Round DOWN, not up: num_max_requests is a hard capacity (req-pool / mamba-cache), so
+    # rounding up (e.g. attn_tp=2: 57 -> 58) makes us capture a bs that can never actually run --
+    # the attention metadata buffers are sized for the real cap (57) while the graph captures 58,
+    # giving "expanded size 57 must match 58" at capture. Flooring keeps every captured bs runnable.
+    # attn_tp==1 (mul_base==1) is unchanged. Guard against flooring to 0 for tiny caps.
+    num_max_requests = max(num_max_requests // mul_base * mul_base, mul_base)
     if max(capture_bs) > num_max_requests:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
