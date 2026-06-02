@@ -17,12 +17,21 @@
 
 """Inference-only NemotronH model."""
 
+import logging
 import os
 from collections.abc import Iterable
 from typing import Optional, Union
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
+
+# Debug: when set, log per-decoder-layer hidden-state stats (norm/mean/absmax + NaN/inf) during
+# extend forwards, to diff DEP8 (replicated attn) vs TP4 (sharded attn) layer-by-layer and localize
+# where DP-attention output diverges. Stats (not exact hashes) since replicated-vs-sharded reductions
+# differ in FP even when correct. Opt-in; off by default.
+_DP_LAYER_HASH = os.environ.get("SGLANG_DP_LAYER_HASH") == "1"
 
 # DP-attention min-1 prototype: when set, use the precompiled CUDA causal_conv1d for prefill/decode
 # (no per-seqlen triton JIT -> no mid-lockstep compile desync under DP concurrency); triton is kept
@@ -691,6 +700,18 @@ class NemotronHModel(nn.Module):
         else:
             self.norm_f = PPMissingLayer(return_tuple=True)
 
+    def _log_layer_stats(self, layer_idx, layer_type, hidden_states, forward_batch):
+        # Debug (SGLANG_DP_LAYER_HASH): per-layer residual-stream stats to localize where DEP8
+        # output diverges from TP4. hidden_states here is this rank's LOCAL token stream; for a
+        # single-request extend it is the real prompt tokens (no orphan pad when rank==global max).
+        h = hidden_states.detach().float()
+        logger.info(
+            f"[LAYERHASH] L{layer_idx:>3} {layer_type:<34} ntok={h.shape[0]} "
+            f"norm={h.norm().item():.5f} mean={h.mean().item():.4e} "
+            f"absmax={h.abs().max().item():.4e} "
+            f"nan={int(torch.isnan(h).sum().item())} inf={int(torch.isinf(h).sum().item())}"
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -710,6 +731,9 @@ class NemotronHModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        if _DP_LAYER_HASH and forward_batch.forward_mode.is_extend():
+            self._log_layer_stats(-1, "embed", hidden_states, forward_batch)
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if not isinstance(layer, Layers):
@@ -719,6 +743,10 @@ class NemotronHModel(nn.Module):
                 residual=residual,
                 forward_batch=forward_batch,
             )
+            if _DP_LAYER_HASH and forward_batch.forward_mode.is_extend():
+                self._log_layer_stats(
+                    i, type(layer).__name__, hidden_states, forward_batch
+                )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
