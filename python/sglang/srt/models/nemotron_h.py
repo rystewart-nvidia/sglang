@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 # differ in FP even when correct. Opt-in; off by default.
 _DP_LAYER_HASH = os.environ.get("SGLANG_DP_LAYER_HASH") == "1"
 
+# Debug (remove pre-PR): log MoE-stage magnitudes to localize the attn_tp>1 ~40x inflation
+# (gather -> experts -> scaling -> all_reduce -> scatter). Capped to the first few emissions.
+_moe_stat_count = [0]
+
+
+def _moe_stat(tag, t):
+    if not _DP_LAYER_HASH or _moe_stat_count[0] >= 30:
+        return
+    _moe_stat_count[0] += 1
+    tf = t.detach().float()
+    logger.info(
+        f"[MOEHASH] {tag:<16} shape={tuple(t.shape)} "
+        f"norm={tf.norm().item():.4f} absmax={tf.abs().max().item():.4f}"
+    )
+
+
 # DP-attention min-1 prototype: when set, use the precompiled CUDA causal_conv1d for prefill/decode
 # (no per-seqlen triton JIT -> no mid-lockstep compile desync under DP concurrency); triton is kept
 # only for the speculative target-verify path (which requires intermediate-state save). Opt-in so
@@ -317,22 +333,40 @@ class NemotronHMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         final_hidden_states, shared_output = self._forward_core(hidden_states)
+        _moe_stat("experts_out", final_hidden_states)
 
         # Fix FP16 overflow
         if hidden_states.dtype != torch.float16:
             final_hidden_states *= self.routed_scaling_factor
+            _moe_stat("after_scaling", final_hidden_states)
         elif self.shared_experts is not None:
             assert shared_output is not None
             shared_output *= 1.0 / self.routed_scaling_factor
 
+        # Under DP attention with attn_tp>1 the shared-expert output is REPLICATED across the
+        # attn-TP ranks, so adding it before the global-TP all_reduce sums it tp_size times
+        # (~tp_size x inflation -> garbage). Add it AFTER the all_reduce in that case. The
+        # routed-expert/latent path stays before the all_reduce (it is EP-partial and must be
+        # combined). attn_tp==1 (DEP8) keeps the original order (verified correct). Mirrors
+        # deepseek_v2's _shared_expert_tp1 handling.
+        shared_after_reduce = (
+            shared_output is not None
+            and is_dp_attention_enabled()
+            and get_attention_tp_size() > 1
+        )
+
         if self.use_latent_moe:
             final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
 
-        if shared_output is not None:
+        if shared_output is not None and not shared_after_reduce:
             final_hidden_states += shared_output
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if shared_after_reduce:
+            final_hidden_states += shared_output
+            _moe_stat("after_shared_postreduce", final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -435,12 +469,14 @@ class NemotronHMoEDecoderLayer(nn.Module):
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            _moe_stat("after_gather", hidden_states)
             hidden_states = self.mixer.forward(hidden_states)
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            _moe_stat("after_scatter", hidden_states)
         else:
             hidden_states = self.mixer.forward(hidden_states)
         return hidden_states, residual
