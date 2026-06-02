@@ -52,3 +52,18 @@ Confirm in the server log that overlap is NOT disabled (no "Disabling overlap sc
 
 This is queued **after** the DEP8 DP-attention min-1 / MAX_LEN+mamba-trim work on
 `feat/dp-attention-min1-lockstep` resolves (works or not), per 2026-06-01 plan.
+
+## RESULT (2026-06-01) — overlap scheduler is a MARGINAL lever, not the big win
+
+- `extra_buffer` is **unsupported** for `NemotronHForCausalLM` (hard assert) — ruled out.
+- `no_buffer` + `--disable-radix-cache` **does** enable the overlap scheduler (TP4, confirmed: no
+  "Disabling overlap schedule" log).
+- **Measured (TP4 no-EP NVFP4, 10k/2k, NO MTP, overlap ON vs the radix-cache/overlap-OFF baseline):**
+  tok/s/GPU c1/2/4/8 = 29.5/53.4/91.5/152.8  vs baseline 28.9/51.7/88.2/149.8 → **only ~+2-3%.**
+- **Key realization:** `server_args.py:2543` disables overlap ONLY when `speculative_algorithm is None`.
+  So **MTP runs already have the overlap scheduler ON** (MTP forces `--disable-radix-cache`). The ~46%
+  GPU-idle was measured on the MTP path, which already had overlap — so the idle is **spec
+  orchestration** (addressed by **spec-v2, +21%**, already done), NOT the general overlap scheduler.
+- **Conclusion:** overlap-scheduler-via-disable-radix is a marginal no-MTP lever and a no-op for MTP.
+  Stream-2 perf work should refocus on the **allreduce+rmsnorm FUSION at concurrency** (this branch's
+  actual contribution; only tested at conc=1 = wash; expected to help at conc>=2) and spec-v2.
