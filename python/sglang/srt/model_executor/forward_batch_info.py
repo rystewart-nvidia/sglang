@@ -57,6 +57,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -75,6 +76,14 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+
+# DP-attention min-1 dummy lockstep prototype (NemotronH separate-layer fix). When set, homogenize
+# idle/decode DP ranks to EXTEND mode whenever any rank is extending, even under SUM_LEN. Without
+# this the idle ranks stay in IDLE mode while the active rank runs EXTEND (a prefill), and
+# NemotronH's separate-layer forward wedges on the mismatched per-layer collectives. SUM_LEN keeps
+# each rank at its real (unpadded) token count, so Mamba's num_actual_tokens assert still holds
+# (MAX_LEN padding would break it). Opt-in so default DP behavior is unchanged.
+_DP_DUMMY_MIN1 = get_bool_env_var("SGLANG_DP_DUMMY_MIN1")
 
 
 class ForwardMode(IntEnum):
@@ -900,7 +909,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
-            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            if self.is_extend_in_batch and (
+                dp_padding_mode.is_max_len() or _DP_DUMMY_MIN1
+            ):
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs

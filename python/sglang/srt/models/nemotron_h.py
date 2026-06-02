@@ -53,7 +53,6 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -62,6 +61,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -244,7 +244,16 @@ class NemotronHMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # torch.compile cannot trace CUDA streams, so use the non-overlapping
         # path when inside piecewise CUDA graph compilation.
-        if _is_cuda and not is_in_piecewise_cuda_graph():
+        # Under DP attention the shared/routed alt_stream overlap deadlocks: the routed-expert
+        # work runs on a side stream while the DP gather/scatter + EP all-reduce run on the
+        # default stream, and the cross-stream/cross-rank ordering wedges (observed: all ranks
+        # hang in _forward_core_shared_routed_overlap on a min-1 idle forward). Use the
+        # single-stream path under DP -- correctness first; the overlap is only a perf win.
+        if (
+            _is_cuda
+            and not is_in_piecewise_cuda_graph()
+            and not is_dp_attention_enabled()
+        ):
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
