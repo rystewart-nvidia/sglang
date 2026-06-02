@@ -58,6 +58,12 @@ _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 # See DEP8-CONCURRENCY-FIX-PLAN.md. Default unset -> path byte-identical.
 _DP_DUMMY_MIN1 = os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1"
 
+# Debug opt-out: when set, skip the MAX_LEN homogenization force below (fall back to the
+# default SUM_LEN cost logic) while leaving the rest of the SGLANG_DP_DUMMY_MIN1 path on.
+# Used to A/B whether MAX_LEN homogenization is the source of a correctness regression vs
+# pre-existing DP-attention brokenness.
+_DP_NO_MAXLEN = os.environ.get("SGLANG_DP_NO_MAXLEN") == "1"
+
 
 class DpPaddingMode(IntEnum):
 
@@ -82,7 +88,7 @@ class DpPaddingMode(IntEnum):
         # max token count and runs identical mamba kernel shapes (JIT/autotune in
         # lockstep). Overrides the SUM_LEN cost optimization below; the extra pad
         # compute is the deliberate price of correctness for hybrid-mamba DP.
-        if _DP_DUMMY_MIN1 and is_extend_in_batch and dp_size > 1:
+        if _DP_DUMMY_MIN1 and not _DP_NO_MAXLEN and is_extend_in_batch and dp_size > 1:
             return DpPaddingMode.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
