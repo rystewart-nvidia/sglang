@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -49,6 +50,14 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
+# NemotronH DP-attention lockstep fix: when set, force MAX_LEN padding for
+# extend-in-batch DP steps so every DP rank forwards an identical token shape.
+# This homogenizes the per-shape mamba triton kernels (causal conv + SSD scan)
+# across ranks so they JIT/autotune in lockstep instead of deadlocking when a
+# lagging rank compiles a novel shape while peers spin at the MoE collective.
+# See DEP8-CONCURRENCY-FIX-PLAN.md. Default unset -> path byte-identical.
+_DP_DUMMY_MIN1 = os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1"
+
 
 class DpPaddingMode(IntEnum):
 
@@ -68,6 +77,13 @@ class DpPaddingMode(IntEnum):
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
         dp_size = get_attention_dp_size()
+
+        # NemotronH lockstep fix: force MAX_LEN so every rank pads to the global
+        # max token count and runs identical mamba kernel shapes (JIT/autotune in
+        # lockstep). Overrides the SUM_LEN cost optimization below; the extra pad
+        # compute is the deliberate price of correctness for hybrid-mamba DP.
+        if _DP_DUMMY_MIN1 and is_extend_in_batch and dp_size > 1:
+            return DpPaddingMode.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.

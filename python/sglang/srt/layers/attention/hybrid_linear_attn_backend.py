@@ -167,6 +167,27 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices
         )
 
+        # DP MAX_LEN padding fills the trailing decode rows with dummy seq_lens
+        # (== cuda-graph fill value) and req_pool_index 0. Mask those padded rows
+        # to PAD_SLOT_ID so selective_state_update / causal_conv1d_update skip them
+        # and do not corrupt slot 0's real SSM/conv state. Mirrors _replay_metadata
+        # (which already does this for the cuda-graph path). No-op when unpadded, so
+        # the default (non-DP-padded) eager path is byte-identical.
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            num_padding = int(
+                torch.count_nonzero(
+                    forward_batch.seq_lens_cpu
+                    == self.get_cuda_graph_seq_len_fill_value()
+                )
+            )
+            if num_padding > 0:
+                mamba_cache_indices[len(mamba_cache_indices) - num_padding :] = (
+                    self.pad_slot_id
+                )
+
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
