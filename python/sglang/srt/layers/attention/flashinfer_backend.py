@@ -441,6 +441,10 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # DP MAX_LEN homogenization may pad input_ids to the global-max token count,
+        # leaving orphan pad rows in q that belong to no request. Default 0 (no padding);
+        # set for the normal-extend path below and consumed in forward_extend.
+        self._dp_num_q_pad = 0
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -531,6 +535,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
             )
+
+            # DP MAX_LEN homogenization: the qo_indptr built above covers only the real
+            # extend tokens (sum of extend_seq_lens), but input_ids was padded to the
+            # global-max token count, so q will have extra orphan pad rows. Record how many
+            # so forward_extend can slice them off (flashinfer requires q.shape[0] ==
+            # qo_indptr[-1]) and zero-fill the output rows (discarded by post_forward trim).
+            # Computed CPU-side; naturally 0 on the default (unpadded) path.
+            esl = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if esl is not None:
+                real_q = int(sum(int(x) for x in esl))
+                self._dp_num_q_pad = max(0, forward_batch.input_ids.shape[0] - real_q)
 
     def init_cuda_graph_state(
         self,
@@ -806,6 +821,23 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+
+        # DP MAX_LEN homogenization: q/k/v carry orphan pad rows (input_ids padded to the
+        # global-max token count) that belong to no request. flashinfer requires
+        # q.shape[0] == qo_indptr[-1] (real tokens only), so slice the pad rows off for the
+        # attention compute and the kv-cache write (pad tokens must not be cached); the
+        # output is zero-padded back to full width below and discarded downstream. No-op
+        # when unpadded (default path).
+        num_q_pad = getattr(self, "_dp_num_q_pad", 0)
+        if num_q_pad > 0:
+            n_real = q.shape[0] - num_q_pad
+            q = q[:n_real]
+            if k is not None:
+                k = k[:n_real]
+            if v is not None:
+                v = v[:n_real]
+            cache_loc = cache_loc[:n_real]
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -896,7 +928,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        o = o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        if num_q_pad > 0:
+            # Restore the orphan pad rows (zero-filled) so the output width matches the
+            # caller's padded hidden_states; these rows are discarded by post_forward.
+            o = torch.nn.functional.pad(o, (0, 0, 0, num_q_pad))
+        return o
 
     @debug_kernel_api
     def forward_decode(
