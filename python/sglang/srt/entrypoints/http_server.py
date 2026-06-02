@@ -1941,6 +1941,33 @@ def _execute_server_warmup(server_args: ServerArgs):
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
+    # DP-attention min-1 dummy lockstep: the default ~6-token warmup is single-chunk, so it never
+    # compiles the chunked-prefill conv (the per-DP chunk_size shape + has_initial_state=True branch
+    # for chunk>=2). Under DP, the idle dummy and the active chunked request take different conv
+    # paths at the same step, so a long request would JIT that conv on one rank while peers wait at
+    # the MoE collective -> deadlock. Force the (balanced) warmup to chunk by sending a prompt longer
+    # than chunked_prefill_size, so BOTH has_initial_state branches at the chunk shape are compiled up
+    # front. Balanced warmup => all ranks compile together (lockstep). Uses input_ids to hit an exact
+    # length without tokenizer dependence. Gated; default warmup unchanged.
+    if (
+        os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1"
+        and model_info["is_generation"]
+        and not server_args.skip_tokenizer_init
+        and not is_vlm
+        and (server_args.chunked_prefill_size or 0) > 0
+    ):
+        warm_len = (
+            2 * server_args.chunked_prefill_size + 16
+        )  # > chunk size -> forces >=2 chunks
+        json_data.pop("text", None)
+        json_data["input_ids"] = [[10] * warm_len for _ in range(server_args.dp_size)]
+        if server_args.dp_size == 1:
+            json_data["input_ids"] = json_data["input_ids"][0]
+        logger.info(
+            f"[DP min-1] chunked-prefill warmup: input_ids len={warm_len} x dp={server_args.dp_size} "
+            f"(chunked_prefill_size={server_args.chunked_prefill_size})"
+        )
+
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
         json_data.pop("text", None)
