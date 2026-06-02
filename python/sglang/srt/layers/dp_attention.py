@@ -91,6 +91,15 @@ class DpPaddingMode(IntEnum):
         if _DP_DUMMY_MIN1 and not _DP_NO_MAXLEN and is_extend_in_batch and dp_size > 1:
             return DpPaddingMode.MAX_LEN
 
+        # SGLANG_DP_NO_MAXLEN: force SUM_LEN for ALL phases (prefill + decode) when DP>1.
+        # Under attn_tp>1 + cuda graph, the MAX_LEN gather path (_dp_gather_via_all_gather =
+        # reduce_scatter over attn_tp + all_gather) deadlocks at decode-graph replay; the SUM_LEN
+        # path (_dp_gather_via_all_reduce, a single tp all_reduce, no attn_tp reduce_scatter) does
+        # not. Pair with SGLANG_DP_DUMMY_MIN1 (min-1 idle dummy) so every rank still has >=1 token
+        # (a 0-token idle rank under a homogeneous-shape graph corrupts output). Off by default.
+        if _DP_NO_MAXLEN and dp_size > 1:
+            return DpPaddingMode.SUM_LEN
+
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
@@ -111,7 +120,9 @@ class DpPaddingMode(IntEnum):
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
+        if _USE_ROCM700A_WA or _DP_NO_MAXLEN:
+            # SGLANG_DP_NO_MAXLEN: capture decode graphs with the SUM_LEN gather (all_reduce) so
+            # replay does not hit the attn_tp reduce_scatter that deadlocks under attn_tp>1.
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN
