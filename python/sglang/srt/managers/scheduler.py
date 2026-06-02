@@ -3997,6 +3997,20 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+
+    # DP-attention min-1 prototype: give each rank its OWN triton cache dir. Under DP attention,
+    # same-node ranks can JIT-compile the SAME triton kernel concurrently (e.g. causal_conv1d for a
+    # novel chunk seqlen). A SHARED TRITON_CACHE_DIR serializes them on a file lock and deadlocks the
+    # lockstep forward (observed: all ranks stuck in compiler _init_handles under concurrency).
+    # Per-rank cache lets each compile independently (NCCL tolerates the timing skew). Set before any
+    # triton use, after the subprocess has its gpu_id. Gated so default behavior is unchanged.
+    if os.environ.get("SGLANG_DP_DUMMY_MIN1") == "1" and (server_args.dp_size or 1) > 1:
+        _triton_base = os.environ.get("TRITON_CACHE_DIR")
+        if _triton_base:
+            os.environ["TRITON_CACHE_DIR"] = os.path.join(
+                _triton_base, f"rank{tp_rank}"
+            )
+
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
