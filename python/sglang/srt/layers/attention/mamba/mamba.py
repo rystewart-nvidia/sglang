@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -62,6 +63,22 @@ elif is_npu():
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
 logger = logging.getLogger(__name__)
+
+# Debug (remove pre-PR): localize where the mamba forward inflates at attn_tp>1 (in_proj ->
+# scan -> gated-norm -> out_proj). Capped; gated on SGLANG_DP_LAYER_HASH.
+_MAMBA_STAT = os.environ.get("SGLANG_DP_LAYER_HASH") == "1"
+_mamba_stat_count = [0]
+
+
+def _mamba_stat(tag, t):
+    if not _MAMBA_STAT or _mamba_stat_count[0] >= 24:
+        return
+    _mamba_stat_count[0] += 1
+    tf = t.detach().float()
+    logger.info(
+        f"[MAMBASTAT] {tag:<14} shape={tuple(t.shape)} "
+        f"norm={tf.norm().item():.4f} absmax={tf.abs().max().item():.4f}"
+    )
 
 
 def mamba_v2_sharded_weight_loader(
@@ -452,6 +469,7 @@ class MambaMixer2(torch.nn.Module):
 
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
+        _mamba_stat("in_proj_out", projected_states)
 
         if mup_vector is not None:
             projected_states = projected_states * mup_vector
@@ -759,10 +777,13 @@ class MambaMixer2(torch.nn.Module):
         # GatedRMSNorm internally applying SiLU to the gate
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
+        _mamba_stat("ssm_out_prenorm", preallocated_ssm_out)
         hidden_states = self.norm(preallocated_ssm_out, gate[:num_actual_tokens])
+        _mamba_stat("after_gatednorm", hidden_states)
 
         # 5. Final linear projection
         output[:num_actual_tokens], _ = self.out_proj(hidden_states)
+        _mamba_stat("after_outproj", output[:num_actual_tokens])
 
     @property
     def mamba_type(self) -> str:

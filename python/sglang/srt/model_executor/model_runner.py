@@ -3406,6 +3406,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.hisparse_coordinator.wait_for_pending_backup()
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+        # Debug (SGLANG_DEBUG_DP_SYNC): per-rank decode decision to localize the attn_tp>1
+        # cuda-graph node-split deadlock (run graph vs eager, padded bs, synced token counts).
+        if os.environ.get("SGLANG_DEBUG_DP_SYNC") == "1" and (
+            forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            logger.info(
+                f"[DPSYNC] mode={forward_batch.forward_mode} can_graph={can_run_graph} "
+                f"bs={forward_batch.batch_size} "
+                f"ngt_cpu={forward_batch.global_num_tokens_cpu} "
+                f"can_dp_graph={getattr(forward_batch, 'can_run_dp_cuda_graph', None)} "
+                f"graph_bs={getattr(self.graph_runner, 'bs', None)}"
+            )
+
         # Replay cuda graph if applicable
         if can_run_graph:
             ret = self.graph_runner.replay(
