@@ -3031,6 +3031,14 @@ class Scheduler(
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
                 bs = len(model_worker_batch.seq_lens)
+                # An idle batch samples no tokens (next_token_ids is empty), so it
+                # must reserve 0 future-token slots. Normal idle batches already have
+                # bs==0; the SGLANG_DP_DUMMY_MIN1 lockstep dummy carries seq_lens=[1]
+                # (a 1-token IDLE forward for collective lockstep) yet still samples
+                # nothing -> without this, store_to_map writes an empty next_token_ids
+                # into a length-1 slot and crashes the overlap scheduler.
+                if model_worker_batch.forward_mode.is_idle():
+                    bs = 0
                 future_indices = self.future_map.alloc_future_indices(bs)
 
                 with self.forward_stream_ctx:
