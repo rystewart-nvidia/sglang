@@ -1082,6 +1082,10 @@ class CudaGraphRunner:
         moe_indices = causal_lm.model.moe_layer_indices
         global_buf = get_global_dp_buffer(get_tp_group())
 
+        # dp_gather_replicate reads forward_batch.dp_padding_mode; real decode batches
+        # from the scheduler have it as None. Restore from capture-time value.
+        forward_batch.dp_padding_mode = dp_padding_mode
+
         set_dp_buffer_len(
             global_dp_buffer_len, num_tokens, dp_padding_mode.is_max_len()
         )
