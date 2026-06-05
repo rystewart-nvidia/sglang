@@ -880,14 +880,51 @@ class CudaGraphRunner:
     # ------------------------------------------------------------------
 
     def _use_dp_gather_segmented(self) -> bool:
-        """True when the model is NemotronH with DP-attention at 4+ nodes (16+ GPU)."""
+        """True when the model is NemotronH with DP-attention at 4+ nodes (16+ GPU).
+
+        Set SGLANG_DP_GATHER_APPROACH=warmup to disable segmented graphs and use
+        the one-shot NCCL pre-warm approach (Approach C) instead.
+        """
+        import os
+
         from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 
+        if os.environ.get("SGLANG_DP_GATHER_APPROACH", "segmented") == "warmup":
+            return False
         return (
             self.model_runner.server_args.enable_dp_attention
             and get_attention_dp_size() > 8
             and isinstance(self.model_runner.model, NemotronHForCausalLM)
         )
+
+    def _use_dp_gather_warmup(self) -> bool:
+        """True when using Approach C: one-shot NCCL pre-warm before monolithic graph replay."""
+        import os
+
+        from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+
+        return (
+            os.environ.get("SGLANG_DP_GATHER_APPROACH", "segmented") == "warmup"
+            and self.model_runner.server_args.enable_dp_attention
+            and get_attention_dp_size() > 8
+            and isinstance(self.model_runner.model, NemotronHForCausalLM)
+        )
+
+    def _warmup_dp_nccl_once(self) -> None:
+        """Run one tiny AllGather on the dp/tp group to pre-warm NCCL cross-node
+        connections before the first monolithic decode graph replay.  Called at
+        most once per runner lifetime; subsequent calls are no-ops."""
+        import torch
+
+        if getattr(self, "_nccl_dp_warmed", False):
+            return
+        tp_group = get_tp_group()
+        n = get_attention_dp_size()
+        dummy_in = torch.zeros(1, dtype=torch.float32, device="cuda")
+        dummy_out = torch.zeros(n, dtype=torch.float32, device="cuda")
+        tp_group.all_gather_into_tensor(dummy_out, dummy_in)
+        torch.cuda.synchronize()
+        self._nccl_dp_warmed = True
 
     def _capture_dp_gather_segmented(
         self,
@@ -1630,6 +1667,13 @@ class CudaGraphRunner:
         if self._use_dp_gather_segmented() and hasattr(self, "_dp_seg_states"):
             if self.bs in self._dp_seg_states:
                 return self._replay_dp_gather_segmented(forward_batch)
+
+        # Approach C: one-shot NCCL pre-warm before monolithic graph replay.
+        # Runs a single tiny AllGather to establish cross-node NCCL connections
+        # before the first graph replay, eliminating the 33% cold-start hang at
+        # 4-node scale without per-step overhead.
+        if self._use_dp_gather_warmup():
+            self._warmup_dp_nccl_once()
 
         # Replay
         variant_label = self._resolve_lora_variant(forward_batch)
