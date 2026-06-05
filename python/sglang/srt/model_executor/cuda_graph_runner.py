@@ -46,13 +46,18 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_gather_replicate,
+    dp_gather_skip_nccl,
     get_attention_cp_size,
+    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_global_dp_buffer,
+    get_tp_group,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import (
     get_deepep_mode,
@@ -846,6 +851,266 @@ class CudaGraphRunner:
         torch.cuda.memory._record_memory_history()
         return profile_context
 
+    # ---- Segmented DP-gather cuda-graph machinery ----------------------------
+    # Approach A fix for the 16-GPU (4-node) decode cuda-graph deadlock.
+    #
+    # ROOT CAUSE: the MAX_LEN dp_gather_replicate call inside the monolithic decode
+    # graph is a cross-node NCCL AllGather that deadlocks under certain fabric
+    # conditions at 4+ nodes (16+ GPU). Both AllGather and AllReduce variants fail;
+    # Fix B (EAGER_IDLE_BATCH) proved unreliable in A/B testing (hung itself 1/4).
+    #
+    # FIX: capture (num_moe_layers + 2) small graph segments instead of one
+    # monolithic graph, with (num_moe_layers + 1) eager AllGathers between them.
+    # No NCCL call is ever captured inside any graph segment.
+    #
+    # Segment structure (M = number of MoE layers in the model = 48 for Ultra):
+    #   seg[0]   : embed + layers[start..m[0]) + norm_only(m[0])
+    #              → writes (hs_norm_bufs[0], r_norm_bufs[0])
+    #   eager[0] : dp_gather_replicate(global_buf, hs_norm_bufs[0])
+    #   seg[1]   : postnorm(m[0], reads global_buf) + layers[m[0]+1..m[1])
+    #              + norm_only(m[1]) → writes (hs_norm_bufs[1], r_norm_bufs[1])
+    #   eager[1] : dp_gather_replicate(global_buf, hs_norm_bufs[1])
+    #   ...
+    #   seg[M]   : postnorm(m[-1]) + layers[m[-1]+1..end) + norm_f
+    #              → writes logits_hs_buf
+    #   eager[M] : dp_gather_replicate(logits_graph_gathered_buf, logits_hs_buf)
+    #   seg[M+1] : logits computation (gather a no-op via dp_gather_skip_nccl fence)
+    #
+    # Activated only for NemotronHForCausalLM + enable_dp_attention + dp_size > 8.
+    # ------------------------------------------------------------------
+
+    def _use_dp_gather_segmented(self) -> bool:
+        """True when the model is NemotronH with DP-attention at 4+ nodes (16+ GPU)."""
+        from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+
+        return (
+            self.model_runner.server_args.enable_dp_attention
+            and get_attention_dp_size() > 8
+            and isinstance(self.model_runner.model, NemotronHForCausalLM)
+        )
+
+    def _capture_dp_gather_segmented(
+        self,
+        bs: int,
+        forward_batch,
+        pool,
+        stream,
+        global_dp_buffer_len: int,
+        num_tokens: int,
+    ):
+        """Capture num_moe+2 graph segments for one batch size, with AllGathers omitted.
+
+        Each segment captures local GPU compute. Eager AllGathers run between segments
+        so no NCCL call is ever inside a replayed cuda graph.
+        Returns (final_graph, final_output) matching capture_one_batch_size expectations.
+        """
+        from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+
+        causal_lm: NemotronHForCausalLM = self.model_runner.model
+        inner_model = causal_lm.model
+        moe_indices = inner_model.moe_layer_indices  # sorted ascending
+        num_moe = len(moe_indices)
+
+        hidden_size = inner_model.config.hidden_size
+        hidden_dtype = next(inner_model.embed_tokens.parameters()).dtype
+        dev = next(inner_model.parameters()).device
+
+        # Pre-allocate external boundary tensors (live outside all graph memory pools).
+        # hs_norm_bufs[k]: normed hidden states after MoE layer k's norm step.
+        #   Written by segment k's graph; read by eager AllGather k; feeds global_buf.
+        # r_norm_bufs[k]: residual after MoE layer k's norm step.
+        #   Written by segment k's graph; read by segment k+1 as its residual input.
+        # logits_hs_buf: post-norm_f hidden states for the logits AllGather.
+        hs_norm_bufs = [
+            torch.empty(num_tokens, hidden_size, dtype=hidden_dtype, device=dev)
+            for _ in range(num_moe)
+        ]
+        r_norm_bufs = [
+            torch.empty(num_tokens, hidden_size, dtype=hidden_dtype, device=dev)
+            for _ in range(num_moe)
+        ]
+        logits_hs_buf = torch.empty(
+            num_tokens, hidden_size, dtype=hidden_dtype, device=dev
+        )
+        # logits_graph_gathered_buf is NOT pre-allocated here — it is captured from
+        # the LogitsMetadata object created during _seg_logits graph capture, because
+        # compute_dp_attention_metadata() allocates it from the CUDA graph pool during
+        # capture and that pool address is fixed for all replays.
+
+        # Setup (warmup passes and pool already done by the caller before this point).
+        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(
+            global_dp_buffer_len, num_tokens, forward_batch.dp_padding_mode.is_max_len()
+        )
+        set_is_extend_in_batch(False)
+        input_ids = self.buffers.input_ids[:num_tokens]
+
+        seg_graphs = []
+
+        # ─── Segment 0: embed + layers[start..m[0]) + norm_only(m[0]) ───────
+        # Writes (hs_norm_bufs[0], r_norm_bufs[0]).
+        g0 = self._create_device_graph()
+        hsnb0, rnb0 = hs_norm_bufs[0], r_norm_bufs[0]
+
+        def _seg0():
+            return inner_model.forward_norm_segment(
+                inner_model.start_layer,
+                moe_indices[0],
+                inner_model.embed_tokens(input_ids),
+                None,
+                forward_batch,
+                hsnb0,
+                rnb0,
+            )
+
+        self._capture_graph(g0, pool, stream, _seg0)
+        seg_graphs.append(g0)
+
+        # ─── Segments 1..num_moe-1: postnorm(m[k-1]) + layers + norm(m[k]) ─
+        for k in range(1, num_moe):
+            # Warmup: fill global_buf so the MoE postnorm has valid input during capture.
+            dp_gather_replicate(
+                get_global_dp_buffer(get_tp_group()),
+                hs_norm_bufs[k - 1][:num_tokens],
+                forward_batch,
+            )
+            gk = self._create_device_graph()
+            _rnb_in = r_norm_bufs[k - 1]
+            _hsnb_out = hs_norm_bufs[k]
+            _rnb_out = r_norm_bufs[k]
+            _postnorm_idx = moe_indices[k - 1]
+            _norm_idx = moe_indices[k]
+
+            def _segk(
+                pi=_postnorm_idx, ni=_norm_idx, ri=_rnb_in, ho=_hsnb_out, ro=_rnb_out
+            ):
+                hs, r = inner_model.forward_postnorm_segment(
+                    pi,
+                    ni,
+                    ri[:num_tokens],
+                    forward_batch,
+                )
+                return inner_model.forward_norm_segment(
+                    ni, ni, hs, r, forward_batch, ho, ro
+                )
+
+            self._capture_graph(gk, pool, stream, _segk)
+            seg_graphs.append(gk)
+
+        # ─── Segment num_moe: postnorm(m[-1]) + remaining layers + norm_f ───
+        # Writes logits_hs_buf.
+        dp_gather_replicate(
+            get_global_dp_buffer(get_tp_group()),
+            hs_norm_bufs[-1][:num_tokens],
+            forward_batch,
+        )
+        g_last = self._create_device_graph()
+        _rnb_last = r_norm_bufs[-1]
+        _lhb = logits_hs_buf
+        _last_postnorm_idx = moe_indices[-1]
+        _end = inner_model.end_layer
+
+        def _seg_last(pi=_last_postnorm_idx, ei=_end, ri=_rnb_last, lhb=_lhb):
+            hs, r = inner_model.forward_postnorm_segment(
+                pi, ei, ri[:num_tokens], forward_batch
+            )
+            hs, _ = inner_model.norm_f(hs, r)
+            lhb[: hs.shape[0]].copy_(hs)
+            return hs
+
+        self._capture_graph(g_last, pool, stream, _seg_last)
+        seg_graphs.append(g_last)
+
+        # ─── Segment num_moe+1: logits (AllGather suppressed by fence) ───────
+        # dp_gather_skip_nccl() makes the in-graph dp_gather_replicate a no-op.
+        # IMPORTANT: LogitsProcessor.forward() converts ForwardBatch → LogitsMetadata
+        # internally, then compute_dp_attention_metadata() allocates gathered_buffer
+        # from the CUDA graph pool on that local object. gathered_buffer does NOT
+        # live on forward_batch. We capture the LogitsMetadata via closure so we
+        # can retrieve the graph-pool address after capture.
+        g_logits = self._create_device_graph()
+        _lhb2 = logits_hs_buf
+        _lm_ref = [None]  # populated during capture; used to retrieve gathered_buffer
+
+        def _seg_logits(lhb=_lhb2):
+            with dp_gather_skip_nccl():
+                lm = LogitsMetadata.from_forward_batch(forward_batch)
+                _lm_ref[0] = lm
+                return causal_lm.logits_processor(
+                    input_ids, lhb[:num_tokens], causal_lm.lm_head, lm
+                )
+
+        out = self._capture_graph(g_logits, pool, stream, _seg_logits)
+        seg_graphs.append(g_logits)
+
+        # gathered_buffer was allocated from the CUDA graph pool inside
+        # compute_dp_attention_metadata() during capture. The graph reads from
+        # that fixed pool address on every replay; eager AllGather must write there.
+        logits_graph_gathered_buf = _lm_ref[0].gathered_buffer
+
+        if not hasattr(self, "_dp_seg_states"):
+            self._dp_seg_states: dict = {}
+        self._dp_seg_states[bs] = {
+            "seg_graphs": seg_graphs,
+            "hs_norm_bufs": hs_norm_bufs,
+            "r_norm_bufs": r_norm_bufs,
+            "logits_hs_buf": logits_hs_buf,
+            "logits_graph_gathered_buf": logits_graph_gathered_buf,
+            "num_tokens": num_tokens,
+            "global_dp_buffer_len": global_dp_buffer_len,
+            "dp_padding_mode": forward_batch.dp_padding_mode,
+        }
+        return g_logits, out
+
+    def _replay_dp_gather_segmented(self, forward_batch) -> LogitsProcessorOutput:
+        """Replay all segments with eager AllGathers between them."""
+        from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+
+        bs = self.bs
+        state = self._dp_seg_states[bs]
+        seg_graphs = state["seg_graphs"]  # len = num_moe + 2
+        hs_norm_bufs = state["hs_norm_bufs"]  # len = num_moe
+        logits_hs_buf = state["logits_hs_buf"]
+        logits_graph_gathered_buf = state[
+            "logits_graph_gathered_buf"
+        ]  # graph-pool addr
+        num_tokens = state["num_tokens"]
+        global_dp_buffer_len = state["global_dp_buffer_len"]
+        dp_padding_mode = state["dp_padding_mode"]  # captured at graph-capture time
+
+        causal_lm: NemotronHForCausalLM = self.model_runner.model
+        moe_indices = causal_lm.model.moe_layer_indices
+        global_buf = get_global_dp_buffer(get_tp_group())
+
+        set_dp_buffer_len(
+            global_dp_buffer_len, num_tokens, dp_padding_mode.is_max_len()
+        )
+        set_is_extend_in_batch(False)
+
+        # Segment 0: embed + layers + norm(m[0]) → hs_norm_bufs[0], r_norm_bufs[0]
+        seg_graphs[0].replay()
+
+        # Segments 1..num_moe-1 and num_moe:
+        #   each preceded by eager AllGather from hs_norm_bufs[k-1].
+        for k in range(1, len(moe_indices) + 1):
+            dp_gather_replicate(
+                global_buf, hs_norm_bufs[k - 1][:num_tokens], forward_batch
+            )
+            seg_graphs[k].replay()
+
+        # Logits segment: eager AllGather into the graph-pool gathered_buffer (captured
+        # address), then replay — graph reads from that exact address.
+        dp_gather_replicate(
+            logits_graph_gathered_buf,
+            logits_hs_buf[:num_tokens],
+            forward_batch,
+        )
+        seg_graphs[-1].replay()
+
+        return self.output_buffers.get(self._make_graph_key(bs, None, None))
+
+    # --------------------------------------------------------------------------
+
     def _post_process_after_profile(self, prof_context):
         torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
@@ -1197,6 +1462,19 @@ class CudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
+        # Segmented DP-gather path: 16-GPU (4-node) NemotronH cuda-graph hang fix.
+        # Runs num_moe+2 small graph segments with eager AllGathers between them,
+        # keeping all NCCL calls out of any captured graph.
+        if self._use_dp_gather_segmented():
+            return self._capture_dp_gather_segmented(
+                bs,
+                forward_batch,
+                get_global_graph_memory_pool(),
+                stream,
+                global_dp_buffer_len,
+                num_tokens,
+            )
+
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
@@ -1341,6 +1619,11 @@ class CudaGraphRunner:
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
+
+        # Segmented DP-gather replay (16-GPU NemotronH hang fix).
+        if self._use_dp_gather_segmented() and hasattr(self, "_dp_seg_states"):
+            if self.bs in self._dp_seg_states:
+                return self._replay_dp_gather_segmented(forward_batch)
 
         # Replay
         variant_label = self._resolve_lora_variant(forward_batch)
