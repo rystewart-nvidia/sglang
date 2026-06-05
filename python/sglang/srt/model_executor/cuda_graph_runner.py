@@ -889,7 +889,8 @@ class CudaGraphRunner:
 
         from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 
-        if os.environ.get("SGLANG_DP_GATHER_APPROACH", "segmented") == "warmup":
+        approach = os.environ.get("SGLANG_DP_GATHER_APPROACH", "segmented")
+        if approach in ("warmup", "monolithic"):
             return False
         return (
             self.model_runner.server_args.enable_dp_attention
