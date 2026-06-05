@@ -1080,7 +1080,6 @@ class CudaGraphRunner:
 
         causal_lm: NemotronHForCausalLM = self.model_runner.model
         moe_indices = causal_lm.model.moe_layer_indices
-        global_buf = get_global_dp_buffer(get_tp_group())
 
         # dp_gather_replicate reads forward_batch.dp_padding_mode; real decode batches
         # from the scheduler have it as None. Restore from capture-time value.
@@ -1090,6 +1089,9 @@ class CudaGraphRunner:
             global_dp_buffer_len, num_tokens, dp_padding_mode.is_max_len()
         )
         set_is_extend_in_batch(False)
+
+        # Allocate global_buf AFTER set_dp_buffer_len so _global_dp_buffer_len is correct.
+        global_buf = get_global_dp_buffer(get_tp_group())
 
         # Segment 0: embed + layers + norm(m[0]) → hs_norm_bufs[0], r_norm_bufs[0]
         seg_graphs[0].replay()
