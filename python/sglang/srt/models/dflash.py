@@ -1,7 +1,6 @@
 # Adapted from the DFlash reference implementation (HF) but implemented with
-# SGLang primitives (RadixAttention + SGLang KV cache). This model intentionally
-# does not include token embeddings or an LM head; DFlash uses the target model's
-# embedding/lm_head.
+# SGLang primitives (RadixAttention + SGLang KV cache). DFlash checkpoints may
+# provide their own token embeddings; the LM head remains owned by the target.
 
 from __future__ import annotations
 
@@ -24,6 +23,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
@@ -326,7 +326,7 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
-    """SGLang DFlash draft model (no embedding / lm_head weights).
+    """SGLang DFlash draft model with optional embedding weights and no LM head.
 
     The checkpoint provides:
       - transformer weights for `layers.*`
@@ -344,6 +344,15 @@ class DFlashDraftModel(nn.Module):
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        self.has_embed_tokens = bool(getattr(config, "has_embed_tokens", False))
+        if self.has_embed_tokens:
+            embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                hidden_size,
+                quant_config=quant_config,
+                prefix=embed_prefix,
+            )
 
         self.layers = nn.ModuleList(
             [
@@ -359,14 +368,20 @@ class DFlashDraftModel(nn.Module):
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
-        target_num_layers = (
-            int(draft_config.num_target_layers)
-            if draft_config.num_target_layers is not None
-            else num_layers
-        )
-        target_layer_ids = draft_config.resolve_target_layer_ids(
-            target_num_layers=target_num_layers, draft_num_layers=num_layers
-        )
+        if draft_config.target_layer_ids is not None:
+            # Only the number of target features matters while constructing the
+            # draft. The target worker validates these IDs against the actual
+            # target model depth.
+            target_layer_ids = list(draft_config.target_layer_ids)
+        else:
+            target_num_layers = (
+                int(draft_config.num_target_layers)
+                if draft_config.num_target_layers is not None
+                else num_layers
+            )
+            target_layer_ids = draft_config.resolve_target_layer_ids(
+                target_num_layers=target_num_layers, draft_num_layers=num_layers
+            )
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
@@ -376,6 +391,9 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+
+    def get_input_embeddings(self) -> Optional[VocabParallelEmbedding]:
+        return getattr(self, "embed_tokens", None)
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
