@@ -155,6 +155,13 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+def _get_dflash_embedding_module(draft_model, target_model):
+    draft_embed_module = draft_model.get_input_embeddings()
+    if draft_embed_module is not None:
+        return draft_embed_module
+    return target_model.get_input_embeddings()
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -1485,7 +1492,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
+        embed_module = _get_dflash_embedding_module(self.draft_model, target_model)
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError(
