@@ -878,11 +878,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
 
-        def _hf(quant_algo="NVFP4"):
+        def _hf(quant_algo="NVFP4", quantized_layers=None):
             return SimpleNamespace(
                 architectures=["NemotronHForCausalLM"],
                 mlp_hidden_act="relu2",
-                quantization_config={"quant_algo": quant_algo},
+                quantization_config={
+                    "quant_algo": quant_algo,
+                    "quantized_layers": quantized_layers or {},
+                },
             )
 
         def _args(mc_quant, hf, **kw):
@@ -914,6 +917,34 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "quantization"
                 ],
                 "modelopt_mixed",
+            )
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt", hf_mixed), hf_mixed)[
+                    "moe_runner_backend"
+                ],
+                "flashinfer_trtllm",
+            )
+
+            hf_w4a16 = _hf(
+                "MIXED_PRECISION",
+                {
+                    "backbone.layers.1.mixer.experts.0.up_proj": {
+                        "quant_algo": "W4A16_NVFP4"
+                    }
+                },
+            )
+            self.assertEqual(
+                _nemotron_h_overrides(_args("modelopt", hf_w4a16), hf_w4a16)[
+                    "moe_runner_backend"
+                ],
+                "marlin",
+            )
+            self.assertNotIn(
+                "moe_runner_backend",
+                _nemotron_h_overrides(
+                    _args("modelopt", hf_w4a16, moe_runner_backend="triton"),
+                    hf_w4a16,
+                ),
             )
         with (
             patch.object(overrides_module, "is_sm100_supported", return_value=False),

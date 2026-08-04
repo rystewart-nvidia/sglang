@@ -1221,6 +1221,20 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         "modelopt_mixed",
     ]
     quantization = server_args.quantization
+    quantization_config = (
+        getattr(model_config.hf_config, "quantization_config", {}) or {}
+    )
+    quantized_layers = (
+        quantization_config.get("quantized_layers", {})
+        if isinstance(quantization_config, dict)
+        else {}
+    )
+    has_w4a16_experts = any(
+        ".experts." in layer_name
+        and isinstance(layer_info, dict)
+        and layer_info.get("quant_algo", "").upper() == "W4A16_NVFP4"
+        for layer_name, layer_info in quantized_layers.items()
+    )
     if is_modelopt:
         assert model_config.hf_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
@@ -1238,7 +1252,13 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     if (is_modelopt or model_config.quantization is None) and (
         server_args.moe_runner_backend == "auto"
     ):
-        if is_sm100_supported() and server_args.moe_a2a_backend == "none":
+        if has_w4a16_experts:
+            overrides["moe_runner_backend"] = "marlin"
+            logger.info(
+                "Use weight-only marlin as MoE runner backend for "
+                f"{model_arch} W4A16_NVFP4 experts"
+            )
+        elif is_sm100_supported() and server_args.moe_a2a_backend == "none":
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
                 f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
