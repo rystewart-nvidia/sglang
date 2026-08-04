@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from torch import nn
 
 from sglang.srt.models import dflash
@@ -173,6 +174,46 @@ class TestDFlashEmbeddingSelection(unittest.TestCase):
         self.assertIs(
             _get_dflash_embedding_module(draft_model, target_model), target_embedding
         )
+
+
+class _FakeW4A16HeadMethod:
+    def __init__(self, dense_weight):
+        self.dense_weight = dense_weight
+
+    def apply(self, _layer, hidden_states, _bias):
+        return torch.matmul(hidden_states, self.dense_weight.T)
+
+
+_FakeW4A16HeadMethod.__name__ = "ModelOptNvFp4A16LinearMethod"
+
+
+class TestDFlashGreedyHead(unittest.TestCase):
+    def test_quantized_head_uses_quant_method_instead_of_packed_weight(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        hidden_states = torch.tensor([[1.0, -2.0, 0.5, 3.0]])
+        dense_weight = torch.tensor(
+            [
+                [0.5, 1.0, -1.0, 0.0],
+                [1.0, 0.0, 1.0, 1.0],
+                [-1.0, 0.0, 0.0, -1.0],
+            ]
+        )
+        lm_head = SimpleNamespace(
+            weight=torch.zeros((3, 1), dtype=torch.int32),
+            quant_method=_FakeW4A16HeadMethod(dense_weight),
+            weight_scale=torch.ones(1),
+            weight_global_scale=torch.ones(1),
+            workspace=torch.empty(1),
+            input_size_per_partition=4,
+            output_size_per_partition=3,
+        )
+
+        actual = DFlashWorkerV2._greedy_sample_from_vocab_parallel_head(
+            SimpleNamespace(), hidden_states=hidden_states, lm_head=lm_head
+        )
+        expected = torch.argmax(hidden_states @ dense_weight.T, dim=-1)
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":
