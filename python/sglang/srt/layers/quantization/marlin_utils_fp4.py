@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import math
+
 import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
@@ -20,6 +23,83 @@ if _is_cuda:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
+logger = logging.getLogger(__name__)
+
+
+def marlin_padded_nk(size_n: int, size_k: int, group_size: int = 16) -> tuple[int, int]:
+    """Return the smallest N/K tile extents accepted by Marlin."""
+
+    group = group_size if group_size > 0 else 1
+    candidates = (
+        (
+            math.ceil(size_n / 64) * 64,
+            math.ceil(size_k / math.lcm(128, group)) * math.lcm(128, group),
+        ),
+        (
+            math.ceil(size_n / 128) * 128,
+            math.ceil(size_k / math.lcm(64, group)) * math.lcm(64, group),
+        ),
+    )
+    padded_nk = min(candidates, key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]))
+    if padded_nk != (size_n, size_k):
+        logger.warning_once(
+            "Marlin requires thread-tile padding for some NVFP4 weight "
+            "shapes. Activations and/or outputs of the padded layers are "
+            "padded/sliced on every forward; performance may be degraded."
+        )
+    return padded_nk
+
+
+def marlin_repacked_nk(qweight: torch.Tensor) -> tuple[int, int]:
+    """Recover padded N/K from a 4-bit Marlin-repacked weight tensor."""
+
+    marlin_tile = 16
+    pack_factor = 8
+    size_k = qweight.size(0) * marlin_tile
+    size_n = qweight.size(1) * pack_factor // marlin_tile
+    return size_n, size_k
+
+
+def marlin_pad_qweight(
+    qweight: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    padded_n: int,
+    padded_k: int,
+) -> torch.Tensor:
+    """Zero-pad a GPTQ-layout packed weight before Marlin repacking."""
+
+    if (padded_n, padded_k) == (size_n, size_k):
+        return qweight
+    pack_factor = size_k // qweight.size(0)
+    return torch.nn.functional.pad(
+        qweight, (0, padded_n - size_n, 0, (padded_k - size_k) // pack_factor)
+    )
+
+
+def marlin_pad_scales(
+    scales: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    padded_n: int,
+    padded_k: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Zero-pad group scales to the Marlin execution extents."""
+
+    if (padded_n, padded_k) == (size_n, size_k):
+        return scales
+    pad_rows = padded_k // group_size - scales.size(0)
+    assert pad_rows >= 0
+    return torch.nn.functional.pad(scales, (0, padded_n - size_n, 0, pad_rows))
+
+
+def marlin_pad_dim(x: torch.Tensor, size: int, padded: int) -> torch.Tensor:
+    """Zero-pad the last dimension of an activation or bias tensor."""
+
+    if padded == size:
+        return x
+    return torch.nn.functional.pad(x, (0, padded - size))
 
 
 def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
@@ -90,11 +170,13 @@ def apply_fp4_marlin_linear(
 
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
+    padded_n, padded_k = marlin_repacked_nk(weight)
+    reshaped_x = marlin_pad_dim(reshaped_x, size_k, padded_k)
 
     use_atomic_add = should_use_atomic_add_reduce(
         m=reshaped_x.size(0),
-        n=size_n,
-        k=size_k,
+        n=padded_n,
+        k=padded_k,
         device=input.device,
         dtype=input.dtype,
     )
@@ -111,8 +193,8 @@ def apply_fp4_marlin_linear(
         workspace=workspace,
         b_q_type=scalar_types.float4_e2m1f,
         size_m=reshaped_x.size(0),
-        size_n=size_n,
-        size_k=size_k,
+        size_n=padded_n,
+        size_k=padded_k,
         is_k_full=True,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
@@ -121,6 +203,8 @@ def apply_fp4_marlin_linear(
     if bias is not None:
         output.add_(bias)
 
+    if padded_n != size_n:
+        output = output[..., :size_n].contiguous()
     return output.reshape(out_shape)
 
 
@@ -132,37 +216,41 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     part_size_n = layer.output_size_per_partition
     part_size_k = layer.input_size_per_partition
+    padded_n, padded_k = marlin_padded_nk(part_size_n, part_size_k)
     param_dtype = getattr(layer, "params_dtype", getattr(layer, "orig_dtype", None))
     if param_dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError("NVFP4 Marlin requires FP16 or BF16 activation dtype.")
 
     assert layer.weight.shape == (part_size_n, part_size_k // 2)
 
-    if part_size_n % 64 != 0:
-        raise ValueError(
-            f"NVFP4 Marlin requires output_size_per_partition to be a multiple of 64, "
-            f"got {part_size_n}."
-        )
-
     device = layer.weight.device
     layer.workspace = marlin_make_workspace(device)
 
     perm = torch.empty(0, dtype=torch.int, device=device)
     qweight = layer.weight.view(torch.int32).T.contiguous()
+    qweight = marlin_pad_qweight(qweight, part_size_n, part_size_k, padded_n, padded_k)
     marlin_qweight = gptq_marlin_repack(
         b_q_weight=qweight,
         perm=perm,
-        size_k=part_size_k,
-        size_n=part_size_n,
+        size_k=padded_k,
+        size_n=padded_n,
         num_bits=4,
     )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
     weight_scale = layer.weight_scale.T.contiguous().to(param_dtype)
+    weight_scale = marlin_pad_scales(
+        weight_scale,
+        part_size_n,
+        part_size_k,
+        padded_n,
+        padded_k,
+        group_size=16,
+    )
     weight_scale = marlin_permute_scales(
         s=weight_scale,
-        size_k=part_size_k,
-        size_n=part_size_n,
+        size_k=padded_k,
+        size_n=padded_n,
         group_size=16,
     )
     weight_scale = nvfp4_marlin_process_scales(weight_scale)
@@ -176,7 +264,7 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
+        bias = marlin_permute_bias(marlin_pad_dim(layer.bias, part_size_n, padded_n))
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
 
