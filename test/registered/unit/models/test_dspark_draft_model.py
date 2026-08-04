@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from torch import nn
 
 from sglang.srt.models import dspark
@@ -36,6 +37,17 @@ class _FakeReplicatedLinear(nn.Module):
                 "prefix": prefix,
             }
         )
+
+
+class _FakeW4A16HeadMethod:
+    def __init__(self, dense_weight):
+        self.dense_weight = dense_weight
+
+    def apply(self, _layer, hidden_states, _bias):
+        return torch.matmul(hidden_states, self.dense_weight.T)
+
+
+_FakeW4A16HeadMethod.__name__ = "ModelOptNvFp4A16LinearMethod"
 
 
 class TestDSparkDraftModel(unittest.TestCase):
@@ -88,6 +100,32 @@ class TestDSparkDraftModel(unittest.TestCase):
 
         self.assertIs(model.embed_tokens, target_embedding)
         self.assertIs(model.lm_head, target_lm_head)
+
+    @patch.object(dspark, "gather_and_crop_vocab", side_effect=lambda logits, _: logits)
+    def test_quantized_target_head_uses_quant_method(self, _gather):
+        hidden = torch.tensor([[1.0, -2.0, 0.5, 3.0]])
+        dense_weight = torch.tensor(
+            [
+                [0.5, 1.0, -1.0, 0.0],
+                [1.0, 0.0, 1.0, 1.0],
+                [-1.0, 0.0, 0.0, -1.0],
+            ]
+        )
+        lm_head = SimpleNamespace(
+            weight=torch.zeros((3, 1), dtype=torch.int32),
+            quant_method=_FakeW4A16HeadMethod(dense_weight),
+            weight_scale=torch.ones(1),
+            weight_global_scale=torch.ones(1),
+            workspace=torch.empty(1),
+            input_size_per_partition=4,
+            output_size_per_partition=3,
+        )
+        draft = SimpleNamespace(lm_head=lm_head)
+
+        actual, confidence = DSparkDraftMixin.compute_base_logits(draft, hidden)
+
+        torch.testing.assert_close(actual, hidden @ dense_weight.T)
+        self.assertIsNone(confidence)
 
 
 if __name__ == "__main__":
