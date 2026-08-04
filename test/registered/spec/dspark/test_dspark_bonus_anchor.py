@@ -8,6 +8,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     DsparkDraftSampler,
+    _resolve_corrected_logits_dtype,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -103,3 +104,27 @@ def test_folded_sampler_skips_bonus_anchor_hidden_state():
     sampler(hidden, input_ids)
 
     torch.testing.assert_close(model.seen_hidden, torch.tensor([[20.0], [30.0]]))
+
+
+def test_folded_sampler_uses_logit_dtype_for_quantized_lm_head():
+    model = SimpleNamespace(
+        config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        lm_head=SimpleNamespace(
+            org_vocab_size=4,
+            weight=torch.empty((4, 1), dtype=torch.uint8),
+        ),
+        markov_head=SimpleNamespace(),
+        confidence_head=None,
+    )
+
+    assert _resolve_corrected_logits_dtype(model) == torch.bfloat16
+    sampler = DsparkDraftSampler(
+        model=model,
+        gamma=2,
+        sample_from_anchor=False,
+        max_bs=1,
+        device="cpu",
+        folded_sampling=True,
+    )
+
+    assert sampler.corrected_out.dtype == torch.bfloat16
