@@ -18,6 +18,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -75,7 +76,9 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
@@ -118,14 +121,14 @@ class DFlashAttention(nn.Module):
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix="qkv_proj",
+            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            prefix="o_proj",
+            prefix=f"{prefix}.o_proj" if prefix else "o_proj",
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -283,17 +286,26 @@ class DFlashMLP(nn.Module):
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
-    def __init__(self, config, layer_id: int, quant_config=None) -> None:
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        attention_prefix = f"{prefix}.self_attn" if prefix else "self_attn"
         self.self_attn = self.attention_cls(
-            config=config, layer_id=layer_id, quant_config=quant_config
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=attention_prefix,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(config=config, quant_config=quant_config)
+        mlp_prefix = f"{prefix}.mlp" if prefix else "mlp"
+        self.mlp = DFlashMLP(
+            config=config, quant_config=quant_config, prefix=mlp_prefix
+        )
 
     def forward(
         self,
@@ -357,7 +369,10 @@ class DFlashDraftModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
-                    config=config, layer_id=i, quant_config=quant_config
+                    config=config,
+                    layer_id=i,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
                 )
                 for i in range(num_layers)
             ]
@@ -385,8 +400,13 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = nn.Linear(
-            self.num_context_features * hidden_size, hidden_size, bias=False
+        fc_prefix = f"{prefix}.fc" if prefix else "fc"
+        self.fc = ReplicatedLinear(
+            self.num_context_features * hidden_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=fc_prefix,
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -405,7 +425,7 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -415,7 +435,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        return self.hidden_norm(self.fc(target_hidden))
+        projected, _ = self.fc(target_hidden)
+        return self.hidden_norm(projected)
 
     @torch.no_grad()
     def forward(
@@ -497,9 +518,11 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
-                if resolved_name.endswith("fc.weight") and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
+                if (
+                    resolved_name.endswith("fc.weight")
+                    and not hasattr(param, "pack_factor")
+                    and tuple(loaded_weight.shape) != tuple(param.shape)
+                ):
                     raise ValueError(
                         "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
                         "number of context features (K) does not match this config. "
@@ -582,7 +605,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return layer.input_layernorm(ctx_hidden)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        expected = int(self.fc.in_features)
+        expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "Laguna DFLASH target_hidden feature dim mismatch. "
