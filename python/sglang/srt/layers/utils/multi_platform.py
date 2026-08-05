@@ -55,14 +55,27 @@ class MultiPlatformOp(nn.Module):
         # The performance of torch.compile on this layer is not always good when bs > 1,
         # so we decide to only use torch.compile when bs=1
         if "FusedMoE" in self.__class__.__name__:
-            if num_tokens == 1:
+            # FlashInfer TRT-LLM rewrites BF16 expert weights into an opaque
+            # block layout after loading.  The torch-native MoE fallback below
+            # expects canonical [expert, output, input] weights, so keep the
+            # registered CUDA implementation for this backend.
+            if num_tokens == 1 and not getattr(
+                self, "use_flashinfer_trtllm_moe", False
+            ):
                 from sglang.srt.layers.moe.fused_moe_native import (
                     fused_moe_forward_native,
                 )
 
                 self._forward_method = fused_moe_forward_native
         elif "TopK" in self.__class__.__name__:
-            if num_tokens == 1:
+            # The non-routed FlashInfer TRT-LLM MoE consumes a bypassed TopK
+            # carrier (routing logits plus config) and performs routing inside
+            # its fused kernel.  Replacing TopK with the native implementation
+            # would instead materialize StandardTopKOutput and violate that
+            # runner contract.
+            from sglang.srt.layers.moe import get_moe_runner_backend
+
+            if num_tokens == 1 and not get_moe_runner_backend().is_flashinfer_trtllm():
                 self._forward_method = self.forward_native
         else:
             self._forward_method = self.forward_native

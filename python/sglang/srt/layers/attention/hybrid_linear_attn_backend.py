@@ -809,6 +809,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch,
         )
 
+    # Mamba updates per-layer views of the persistent state pools in place.
+    # Inductor functionalization otherwise clones the full all-layer pools,
+    # which can add tens of GiB of temporary allocations during compilation.
+    @torch.compiler.disable
     def forward(
         self,
         mixer: MambaMixer2,
