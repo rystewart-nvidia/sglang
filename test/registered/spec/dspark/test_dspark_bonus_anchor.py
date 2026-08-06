@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import torch
@@ -48,6 +49,21 @@ def test_missing_layout_fields_preserve_sample_from_anchor_behavior():
 
     assert parsed.gamma == 8
     assert parsed.sample_from_anchor
+
+
+def test_gamma_override_warning_names_resolved_config_gamma(caplog):
+    hf_config = _config(sample_from_anchor=False, dspark_bonus_anchor=True)
+
+    with caplog.at_level(logging.WARNING):
+        runtime = resolve_runtime_config(
+            draft_hf_config=hf_config,
+            speculative_num_draft_tokens=7,
+            target_vocab_size=131072,
+        )
+
+    assert runtime.gamma == 6
+    assert "resolved draft config gamma=7" in caplog.text
+    assert "draft config block_size=7" not in caplog.text
 
 
 def test_draft_graph_width_tracks_dspark_query_layout():

@@ -103,7 +103,8 @@ def resolve_runtime_config(
         if config_gamma is not None and int(config_gamma) != gamma:
             logger.warning(
                 "DSpark gamma mismatch: using gamma=%s (from "
-                "speculative_num_draft_tokens=%s) but draft config block_size=%s.",
+                "speculative_num_draft_tokens=%s) but resolved draft config "
+                "gamma=%s.",
                 gamma,
                 speculative_num_draft_tokens,
                 config_gamma,
