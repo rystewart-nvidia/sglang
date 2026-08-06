@@ -13,6 +13,9 @@ from torch import nn
 
 from sglang.srt.models import dflash
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.speculative.dflash_utils import (
+    get_dflash_attention_sliding_window_size,
+)
 from sglang.srt.speculative.dflash_worker_v2 import _get_dflash_embedding_module
 
 
@@ -136,6 +139,14 @@ class TestDFlashDraftModel(unittest.TestCase):
 
 
 class TestDFlashDecoderLayer(unittest.TestCase):
+    def test_sliding_window_falls_back_to_published_dflash_config(self):
+        config = SimpleNamespace(
+            layer_types=["sliding_attention"],
+            dflash_config={"swa_window_size": 1024},
+        )
+
+        self.assertEqual(get_dflash_attention_sliding_window_size(config), 1023)
+
     @patch.object(dflash, "DFlashMLP", _FakeMLP)
     @patch.object(dflash, "RMSNorm", _FakeNorm)
     def test_attention_receives_quant_config_and_full_prefix(self):
