@@ -33,6 +33,7 @@ not implemented.
 | [Offline WAV inference](offline-inference.md) | Run a prerecorded WAV through direct SGLang engine sessions |
 | [Deploy and run](deploy.md) | Start both services and use microphone or WAV clients |
 | [API reference](api-reference.md) | HTTP/WebSocket endpoints, events, audio formats, errors, and limits |
+| [Accuracy validation](accuracy.md) | Measured agreement with the reference implementation, and what is not compared |
 
 Start with [Prerequisites](prerequisites.md). After converting the checkpoint
 into `duplex/` and `eartts/`, choose [Offline WAV inference](offline-inference.md)
